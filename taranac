@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Thin wrapper for day-to-day operations, so you don't retype the full compose
+# invocation. From the bundle directory:
+#
+#   ./taranac ps                 # status
+#   ./taranac logs -f api        # follow a service's logs
+#   ./taranac restart edge       # apply a new TLS cert
+#   ./taranac up -d taranac-mfa  # apply a new Firebase key
+#   ./taranac down               # stop everything
+#
+#   ./taranac unlock             # list locked web-admin accounts
+#   ./taranac unlock admin       # unlock a locked account (e.g. after a brute-force)
+#   ./taranac unlock --all       # unlock every locked account
+#
+#   ./taranac reset-password admin   # reset a forgotten web-admin password
+#   ./taranac create-admin           # recover/guarantee an admin login (create-or-repair)
+#
+#   ./taranac reset                  # show what a factory reset would do (no changes)
+#   ./taranac reset --confirm RESET  # factory-reset the system (demo/dev only; auto-backup first)
+#
+#   ./taranac version            # show installed version + check for a newer one
+#   ./taranac update             # update images AND bundle files to the latest
+#
+# Equivalent (for compose passthrough): docker compose --env-file .env -f docker-compose.yml <args>
+set -euo pipefail
+HERE="$(dirname "$(readlink -f "$0")")"
+cd "${HERE}"
+
+# NOTE: invoke docker directly with `exec docker compose …`. `exec` replaces the
+# shell with an external program and cannot run a shell function, so a `compose()`
+# helper would fail here with "exec: compose: not found".
+
+case "${1:-}" in
+  # Convenience subcommands handled by the wrapper, not passed to compose:
+  unlock)
+    # Run the account-unlock tool inside the api container so a locked-out
+    # admin can recover without the web UI.
+    [ -f .env ] || { echo "No .env found — run ./install.sh first." >&2; exit 1; }
+    shift
+    exec docker compose --env-file .env -f docker-compose.yml exec -T api \
+      python -m app.scripts.unlock_user "$@"
+    ;;
+  reset-password)
+    # Reset a web-admin password from the console (forgotten admin password).
+    [ -f .env ] || { echo "No .env found — run ./install.sh first." >&2; exit 1; }
+    shift
+    exec docker compose --env-file .env -f docker-compose.yml exec -T api \
+      python -m app.scripts.reset_password "$@"
+    ;;
+  create-admin)
+    # Recover/guarantee an admin login (create-or-repair) when none works.
+    [ -f .env ] || { echo "No .env found — run ./install.sh first." >&2; exit 1; }
+    shift
+    exec docker compose --env-file .env -f docker-compose.yml exec -T api \
+      python -m app.scripts.create_admin "$@"
+    ;;
+  reset)
+    # Factory-reset the system (demo stands). Wipes all data and restores the
+    # fresh-install state. Guarded by APP_ENV (demo/dev only) + an explicit
+    # --confirm RESET, and takes a backup before wiping. No args = dry-run plan.
+    [ -f .env ] || { echo "No .env found — run ./install.sh first." >&2; exit 1; }
+    shift
+    exec docker compose --env-file .env -f docker-compose.yml exec -T api \
+      python -m app.scripts.system_reset "$@"
+    ;;
+  version|update)
+    # Self-update: refreshes BOTH images and the bundle files (this wrapper,
+    # compose, install.sh, docs). Logic lives in taranac-update.sh.
+    [ -f "${HERE}/taranac-update.sh" ] || {
+      echo "taranac-update.sh is missing — refresh the bundle once, then retry." >&2
+      echo "Download the latest bundle from the project releases and copy it here." >&2
+      exit 1
+    }
+    exec bash "${HERE}/taranac-update.sh" "$@"
+    ;;
+esac
+
+[ -f .env ] || { echo "No .env found — run ./install.sh first." >&2; exit 1; }
+exec docker compose --env-file .env -f docker-compose.yml "$@"

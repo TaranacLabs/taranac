@@ -1,0 +1,8 @@
+# Never commit the generated environment or operator secrets.
+.env
+config/tls/*
+!config/tls/.gitkeep
+!config/tls/README.md
+config/firebase/*
+!config/firebase/.gitkeep
+!config/firebase/README.md

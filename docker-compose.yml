@@ -1,0 +1,299 @@
+# =============================================================================
+# Taranac — distribution compose (pulls published images; no source needed)
+#
+#   docker compose --env-file .env -f docker-compose.yml pull
+#   docker compose --env-file .env -f docker-compose.yml up -d
+#
+# Use ./install.sh for first-time setup (it generates secrets + writes .env).
+# Images come from ${IMAGE_PREFIX}/<service>:${TARANAC_VERSION}.
+# =============================================================================
+name: taranac
+
+services:
+  # ── Edge reverse proxy — the PUBLIC TLS the browser/phone sees ──────
+  edge:
+    container_name: taranac-edge
+    image: ${IMAGE_PREFIX}/edge:${TARANAC_VERSION}
+    ports:
+      - "${EDGE_HTTP_PORT:-80}:80"
+      - "${EDGE_HTTPS_PORT:-443}:443"
+    environment:
+      TARANAC_DOMAIN: ${TARANAC_DOMAIN}
+      TARANAC_MFA_DOMAIN: ${TARANAC_MFA_DOMAIN:-}
+      TARANAC_TLS_CERT: ${TARANAC_TLS_CERT:-/etc/taranac/tls/tls.crt}
+      TARANAC_TLS_KEY: ${TARANAC_TLS_KEY:-/etc/taranac/tls/tls.key}
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      # Operator-supplied public certificate (tls.crt + tls.key). Optional —
+      # the edge self-signs if absent.
+      - ./config/tls:/etc/taranac/tls:ro
+      # Internal CA, to verify the taranac-mfa upstream when fronted.
+      - taranac_certs:/opt/taranac/certs:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Frontend — Metronic 8 React (internal; fronted by edge) ─────────
+  frontend:
+    container_name: taranac-frontend
+    image: ${IMAGE_PREFIX}/frontend:${TARANAC_VERSION}
+    volumes:
+      - taranac_certs:/opt/taranac/certs:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      # 127.0.0.1, not localhost — nginx listens on IPv4 only; localhost resolves
+      # to ::1 first inside the container and the check would falsely fail.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:80"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ── Backend API — FastAPI (HTTPS) ───────────────────────────────────
+  api:
+    container_name: taranac-api
+    image: ${IMAGE_PREFIX}/api:${TARANAC_VERSION}
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://taranac:${POSTGRES_PASSWORD}@postgres:5432/taranac
+      MONITORING_HOST_ROOT: /host
+      SUPPORTED_LOCALES: "${SUPPORTED_LOCALES:-en,ru}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+      - /:/host:ro
+      - app_logs:/app/logs
+      - aaa_logs:/app/logs/aaa
+      - tacacs_logs:/app/logs/tacacs:ro
+      - radius_logs:/app/logs/radius:ro
+      - nac_logs:/app/logs/nac:ro
+      # Daemon config dirs (shared with the daemons): the api generates their
+      # configs here and runs the file-based health handshake (.health_signal /
+      # .health_result.json). Without these the UI shows the daemons unavailable.
+      - tacacs_config:/etc/tac_plus
+      - radius_config:/mnt/radius_config
+      - nac_config:/mnt/nac_config
+      - captive_portal_config:/mnt/captive_portal_config
+      - taranac_certs:/opt/taranac/certs
+      - vendor_dictionaries:/opt/taranac/vendor_dictionaries
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "--cacert", "/opt/taranac/certs/ca.crt", "https://localhost:8000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: "json-file"
+      options: { max-size: "100m", max-file: "10" }
+
+  # ── Taranac MFA — Push/TOTP (HTTPS) ─────────────────────────────────
+  taranac-mfa:
+    container_name: taranac-mfa
+    image: ${IMAGE_PREFIX}/mfa:${TARANAC_VERSION}
+    ports: ["${MFA_PORT:-8443}:8443"]
+    environment:
+      TARANAC_MFA_API_KEY: ${TARANAC_MFA_API_KEY}
+      TARANAC_MFA_DATABASE_URL: postgresql://taranac:${POSTGRES_PASSWORD}@postgres:5432/taranac_mfa
+      TARANAC_MFA_SECRET_KEY_FILE: /opt/taranac/data/enckey
+      TARANAC_MFA_FIREBASE_JSON: /opt/taranac/firebase/firebase-credentials.json
+      TARANAC_MFA_LOG_LEVEL: INFO
+      TARANAC_MFA_LOG_FORMAT: json
+      TARANAC_MFA_CORS_ORIGINS: ""
+      TARANAC_MFA_PUSH_REGISTRATION_URL: ${TARANAC_MFA_PUSH_REGISTRATION_URL}
+      TARANAC_MFA_TLS_CERT: /opt/taranac/certs/mfa/server.crt
+      TARANAC_MFA_TLS_KEY: /opt/taranac/certs/mfa/server.key
+      INTERNAL_TLS_VERIFY: "${INTERNAL_TLS_VERIFY:-true}"
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+      - mfa_data:/opt/taranac/data
+      # Optional Firebase service-account key (paid push tier). Without it,
+      # MFA runs in free poll-only mode.
+      - ./config/firebase:/opt/taranac/firebase:ro
+      - taranac_certs:/opt/taranac/certs:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sfk", "https://localhost:8443/readyz"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: "json-file"
+      options: { max-size: "100m", max-file: "10" }
+
+  # ── TACACS+ — tac_plus-ng ───────────────────────────────────────────
+  tacacs:
+    container_name: taranac-tacacs
+    image: ${IMAGE_PREFIX}/tacacs:${TARANAC_VERSION}
+    ports:
+      - "${TACACS_PORT:-49}:49"
+      - "${TACACS_TLS_PORT:-6049}:6049"
+    env_file: .env
+    environment:
+      TACACS_DB_URL: "postgresql://taranac:${POSTGRES_PASSWORD}@postgres:5432/taranac"
+      TACACS_MASTER_KEY_FILE: "/run/secrets/master_key"
+      MASTER_KEY: "${MASTER_KEY:-}"
+      INTERNAL_TLS_VERIFY: "${INTERNAL_TLS_VERIFY:-true}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+      - tacacs_config:/etc/tac_plus
+      - tacacs_logs:/var/log/taranac
+      - master_key:/run/secrets
+      - taranac_certs:/opt/taranac/certs:ro
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options: { max-size: "100m", max-file: "10" }
+
+  # ── RADIUS — FreeRADIUS 3.2 + rlm_python3 ───────────────────────────
+  radius:
+    container_name: taranac-radius
+    image: ${IMAGE_PREFIX}/radius:${TARANAC_VERSION}
+    ports:
+      - "${RADIUS_AUTH_PORT:-1812}:1812/udp"
+      - "${RADIUS_ACCT_PORT:-1813}:1813/udp"
+    env_file: .env
+    environment:
+      RADIUS_DB_URL: "postgresql://taranac:${POSTGRES_PASSWORD}@postgres:5432/taranac"
+      RADIUS_MASTER_KEY_FILE: "/run/secrets/master_key"
+      MASTER_KEY: "${MASTER_KEY:-}"
+      LOG_LEVEL: "INFO"
+      CONFIG_WAIT_TIMEOUT: "120"
+      INTERNAL_TLS_VERIFY: "${INTERNAL_TLS_VERIFY:-true}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+      - radius_config:/etc/raddb
+      - radius_logs:/var/log/taranac
+      - master_key:/run/secrets
+      - taranac_certs:/opt/taranac/certs:ro
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options: { max-size: "100m", max-file: "10" }
+
+  # ── NAC — FreeRADIUS 3.2 (802.1X) ───────────────────────────────────
+  nac:
+    container_name: taranac-nac
+    image: ${IMAGE_PREFIX}/nac:${TARANAC_VERSION}
+    ports:
+      - "${NAC_AUTH_PORT:-1814}:1814/udp"
+      - "${NAC_ACCT_PORT:-1815}:1815/udp"
+      - "${NAC_COA_PORT:-3799}:3799/udp"
+    env_file: .env
+    environment:
+      NAC_DB_URL: "postgresql://taranac:${POSTGRES_PASSWORD}@postgres:5432/taranac"
+      NAC_MASTER_KEY_FILE: "/run/secrets/master_key"
+      MASTER_KEY: "${MASTER_KEY:-}"
+      LOG_LEVEL: "INFO"
+      CONFIG_WAIT_TIMEOUT: "120"
+      INTERNAL_TLS_VERIFY: "${INTERNAL_TLS_VERIFY:-true}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+      - nac_config:/etc/raddb
+      - nac_certs:/etc/raddb/certs/nac
+      - nac_logs:/var/log/taranac
+      - master_key:/run/secrets
+      - vendor_dictionaries:/opt/nac_module/vendor_dictionaries:ro
+      - taranac_certs:/opt/taranac/certs:ro
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options: { max-size: "100m", max-file: "10" }
+
+  # ── Captive Portal — nginx (embedded) ───────────────────────────────
+  captive-portal:
+    container_name: taranac-captive-portal
+    image: ${IMAGE_PREFIX}/captive-portal:${TARANAC_VERSION}
+    ports:
+      - "${CAPTIVE_PORTAL_HTTP_PORT:-8080}:80"
+      - "${CAPTIVE_PORTAL_HTTPS_PORT:-8444}:443"
+    environment:
+      INTERNAL_TLS_VERIFY: "${INTERNAL_TLS_VERIFY:-true}"
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+      - captive_portal_config:/etc/nginx/portal.d
+      - portal_instance_data:/app/data
+      - taranac_certs:/opt/taranac/certs:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options: { max-size: "100m", max-file: "10" }
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────
+  postgres:
+    container_name: taranac-db
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: taranac
+      POSTGRES_USER: taranac
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      # Creates the taranac_mfa database on first init (no-op on an existing DB).
+      - ./postgres-initdb:/docker-entrypoint-initdb.d:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U taranac -d taranac"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  app_logs: {}
+  aaa_logs: {}
+  tacacs_logs: {}
+  radius_logs: {}
+  nac_logs: {}
+  pg_data: {}
+  mfa_data: {}
+  master_key: {}
+  tacacs_config: {}
+  radius_config: {}
+  nac_config: {}
+  nac_certs: {}
+  captive_portal_config: {}
+  portal_instance_data: {}
+  taranac_certs: {}
+  vendor_dictionaries: {}
+
+networks:
+  default:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.255.255.240/28
