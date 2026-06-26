@@ -117,3 +117,11 @@ files once, then `update` is self-maintaining afterward —
 | `nac`            | RADIUS daemon for 802.1X (port access control)    |
 | `captive-portal` | Guest/onboarding portal                           |
 | `postgres`       | Database                                          |
+
+## License
+
+Taranac is licensed under the **Elastic License 2.0** — see [LICENSE](LICENSE).
+You may run it for free, including for commercial and internal production use.
+You may **not** offer it to others as a hosted/managed service, circumvent its
+license-key functionality, or remove its notices. "Taranac" is a trademark of
+TaranacLabs.
