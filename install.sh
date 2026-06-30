@@ -6,7 +6,10 @@
 #              writes .env, pulls the images and starts the stack.
 # Later runs:  detects an existing .env, NEVER regenerates secrets (changing
 #              MASTER_KEY would brick all stored secrets), just pulls + restarts
-#              — i.e. this same script is also the upgrade command.
+#              — i.e. this same script is also the upgrade command. On a converted
+#              HA node it merges the Patroni overlay automatically (never base-only).
+# --no-start:  write/refresh .env but do NOT start the stack — use this to prepare a
+#              node that will JOIN an HA cluster (then copy the HA block + ha-join.sh).
 #
 # Requires: docker (with the compose plugin), openssl.
 # =============================================================================
@@ -17,6 +20,8 @@ cd "${SCRIPT_DIR}"
 
 ENV_FILE="${SCRIPT_DIR}/.env"
 COMPOSE_FILE="${SCRIPT_DIR}/docker-compose.yml"
+COMPOSE_HA_FILE="${SCRIPT_DIR}/docker-compose.ha.yml"
+COMPOSE_ARGS=(-f "${COMPOSE_FILE}")
 
 c_bold=$'\033[1m'; c_green=$'\033[32m'; c_yellow=$'\033[33m'; c_red=$'\033[31m'; c_reset=$'\033[0m'
 info()  { printf '%s\n' "${c_bold}==>${c_reset} $*"; }
@@ -24,12 +29,53 @@ ok()    { printf '%s\n' "${c_green}✓${c_reset} $*"; }
 warn()  { printf '%s\n' "${c_yellow}!${c_reset} $*"; }
 die()   { printf '%s\n' "${c_red}✗ $*${c_reset}" >&2; exit 1; }
 
+# ── Arguments (parsed BEFORE the prerequisite checks so `--help` works even on a
+# box without docker yet) ─────────────────────────────────────────────
+# --no-start: write/refresh configuration but do NOT pull or start the stack. Used to
+# prepare a node that will JOIN an HA cluster — ha-join.sh needs a configured .env AND
+# an EMPTY data volume, so the node must not first come up as a standalone primary
+# (which would initialise the volume and trip ha-join's empty-volume guard).
+NO_START=0
+for arg in "$@"; do
+  case "$arg" in
+    --no-start)   NO_START=1 ;;
+    -h|--help)    sed -n '2,13p' "$0"; exit 0 ;;
+    *)            die "unknown argument: ${arg} (supported: --no-start)" ;;
+  esac
+done
+
 # ── Prerequisites ────────────────────────────────────────────────────
 command -v docker  >/dev/null 2>&1 || die "docker is not installed."
 command -v openssl >/dev/null 2>&1 || die "openssl is not installed."
 docker compose version >/dev/null 2>&1 || die "the docker compose plugin is not available."
 
-compose() { docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" "$@"; }
+# Merge the HA overlay when this node is configured for HA. install.sh is also the
+# documented UPGRADE command, so on a converted node it must NOT bring the stack up on
+# the base compose alone: that starts a 2nd writable postgres on the Patroni-managed
+# PGDATA → split-brain / data loss. Mirrors ./taranac + taranac-update.sh (ha.md §13 A).
+# Detection fails TOWARD the overlay: the explicit TARANAC_HA=1 marker (written by
+# ha-convert.sh / ha-join.sh) is authoritative; ANY uncommented non-empty DB_HOSTS is
+# the defense-in-depth fallback (robust to `export `/spaces/quotes; value not parsed).
+ha_is_configured() {  # $1 = path to .env; 0 = HA, 1 = standalone
+    local env="$1"
+    [ -f "${env}" ] || return 1
+    if grep -Eq '^[[:space:]]*(export[[:space:]]+)?TARANAC_HA[[:space:]]*=[[:space:]]*"?1"?[[:space:]]*$' "${env}"; then
+        return 0
+    fi
+    if grep -Eiq '^[[:space:]]*(export[[:space:]]+)?DB_HOSTS[[:space:]]*=[[:space:]]*"?[^"[:space:]#]' "${env}"; then
+        return 0
+    fi
+    return 1
+}
+
+resolve_compose_files() {
+    ha_is_configured "${ENV_FILE}" || return 0    # standalone → base compose only
+    [ -f "${COMPOSE_HA_FILE}" ] || die "HA is configured in .env but docker-compose.ha.yml is missing — refusing to (re)start on the base compose alone (under HA that starts a 2nd writable Postgres on the Patroni data dir → split-brain). Restore the overlay from the bundle."
+    COMPOSE_ARGS=(-f "${COMPOSE_FILE}" -f "${COMPOSE_HA_FILE}")
+    warn "HA node detected — using the Patroni overlay. Upgrade ONE node at a time (replicas first, primary last); back up first. (HA.md §6)"
+}
+
+compose() { docker compose --env-file "${ENV_FILE}" "${COMPOSE_ARGS[@]}" "$@"; }
 
 # ── Secret generators ────────────────────────────────────────────────
 # URL-safe (hex) — used inside connection strings.
@@ -54,6 +100,11 @@ pull_images() {
 if [ -f "${ENV_FILE}" ]; then
     warn ".env already exists — treating this as an upgrade/restart."
     warn "Secrets (including MASTER_KEY) are left untouched."
+    resolve_compose_files          # merges the HA overlay on a converted node (or dies if missing)
+    if [ "${NO_START}" = "1" ]; then
+        ok "--no-start: configuration left in place; stack NOT pulled or restarted."
+        exit 0
+    fi
     pull_images
     info "Starting stack..."
     compose up -d
@@ -68,24 +119,33 @@ echo
 read -rp "Primary domain for the admin UI [taranac.example.com]: " TARANAC_DOMAIN
 TARANAC_DOMAIN="${TARANAC_DOMAIN:-taranac.example.com}"
 
-read -rp "Separate domain for MFA push (phones), blank to skip: " TARANAC_MFA_DOMAIN
-TARANAC_MFA_DOMAIN="${TARANAC_MFA_DOMAIN:-}"
-
 read -rp "Initial admin username [admin]: " INITIAL_ADMIN_USERNAME
 INITIAL_ADMIN_USERNAME="${INITIAL_ADMIN_USERNAME:-admin}"
 
 read -rp "Initial admin email [admin@${TARANAC_DOMAIN}]: " INITIAL_ADMIN_EMAIL
 INITIAL_ADMIN_EMAIL="${INITIAL_ADMIN_EMAIL:-admin@${TARANAC_DOMAIN}}"
 
-read -rp "Image registry prefix [ghcr.io/taranaclabs/taranac]: " IMAGE_PREFIX
+# Registry, image tag and the optional MFA-push domain are NOT prompted — they are
+# bundle properties, not operator choices, and prompting for them is how the tag
+# drifted from the shipped images. The version is read from the bundle's VERSION
+# file (the single source of truth, stamped at release time); the registry defaults
+# to the public one. All three remain overridable via the environment for mirrors /
+# air-gapped installs (e.g. IMAGE_PREFIX=registry.local/taranac ./install.sh).
 IMAGE_PREFIX="${IMAGE_PREFIX:-ghcr.io/taranaclabs/taranac}"
-
-read -rp "Version tag [1.0.0]: " TARANAC_VERSION
-TARANAC_VERSION="${TARANAC_VERSION:-1.0.0}"
+TARANAC_MFA_DOMAIN="${TARANAC_MFA_DOMAIN:-}"
+if [ -z "${TARANAC_VERSION:-}" ]; then
+    [ -f "${SCRIPT_DIR}/VERSION" ] || die "VERSION file is missing from the bundle — cannot determine which image tag to install. Re-extract a complete bundle."
+    TARANAC_VERSION="$(head -1 "${SCRIPT_DIR}/VERSION" | tr -d '[:space:]')"
+    [ -n "${TARANAC_VERSION}" ] || die "VERSION file is empty — cannot determine which image tag to install."
+fi
+info "Installing Taranac ${c_bold}${TARANAC_VERSION}${c_reset} from ${IMAGE_PREFIX}"
 
 # ── Generate secrets ─────────────────────────────────────────────────
 info "Generating secrets..."
 POSTGRES_PASSWORD="$(gen_hex 24)"
+# Generated even on a single node so a later convert-to-HA already has a strong
+# replicator password (the replicator role is created on first init; ha.md §6.7).
+POSTGRES_REPLICATION_PASSWORD="$(gen_hex 24)"
 SECRET_KEY="$(gen_hex 48)"
 MASTER_KEY="$(gen_fernet)"
 INTERNAL_API_KEY="$(gen_hex 32)"
@@ -118,6 +178,25 @@ TARANAC_TLS_KEY=/etc/taranac/tls/tls.key
 
 POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
 DATABASE_URL=postgresql+asyncpg://taranac:${POSTGRES_PASSWORD}@postgres:5432/taranac
+POSTGRES_REPLICATION_PASSWORD=${POSTGRES_REPLICATION_PASSWORD}
+
+# Stable node identity (the container hostname churns on recreate). Under HA make it
+# unique per node = the node's Patroni member name. See docs/guide/ha.md.
+TARANAC_NODE_NAME=taranac-node-1
+
+# ─── HA / clustering (Pro) — leave commented on a single node ───
+# To go HA: uncomment + fill these (the SAME on every node except the per-node ones),
+# bring up a witness on a 3rd host, then run ha-convert.sh (seed) / ha-join.sh (nodes).
+# Full guidance: docs/guide/ha.md and the .env.example HA block.
+#DB_HOSTS=10.0.0.1:5432,10.0.0.2:5432
+#DB_CONNECT_TIMEOUT=3
+#TARANAC_CLUSTER_NAME=taranac
+#NODE_ADDRESS=10.0.0.1
+#PG_ALLOW_CIDR=10.0.0.0/24
+#ETCD_NAME=taranac-node-1
+#ETCD_INITIAL_CLUSTER=taranac-node-1=http://10.0.0.1:2380,taranac-node-2=http://10.0.0.2:2380,witness=http://10.0.0.3:2380
+#ETCD_INITIAL_CLUSTER_STATE=new
+#ETCD_HOSTS=10.0.0.1:2379,10.0.0.2:2379,10.0.0.3:2379
 
 APP_HOST=0.0.0.0
 APP_PORT=8000
@@ -181,6 +260,17 @@ mkdir -p "${SCRIPT_DIR}/config/tls" "${SCRIPT_DIR}/config/firebase"
 ok "Created config/tls/ (drop tls.crt + tls.key here) and config/firebase/."
 
 # ── Pull and start ───────────────────────────────────────────────────
+resolve_compose_files          # standalone here (DB_HOSTS commented) → base compose only
+if [ "${NO_START}" = "1" ]; then
+    echo
+    ok ".env written; the stack was NOT started (--no-start)."
+    info "This node is ready to JOIN an HA cluster:"
+    info "  1. copy the cluster-wide HA block from the primary's .env into ${ENV_FILE}"
+    info "     (TARANAC_CLUSTER_NAME, DB_HOSTS, ETCD_*, POSTGRES_PASSWORD, POSTGRES_REPLICATION_PASSWORD, PG_ALLOW_CIDR)"
+    info "  2. on the primary, issue a join token: ./taranac cluster join-token --name <node> --address <addr>"
+    info "  3. on this node:  MASTER_KEY=<key> ./ha-join.sh --node-name <node> --node-address <addr> --join-token <secret>"
+    exit 0
+fi
 pull_images
 info "Starting the stack..."
 compose up -d

@@ -23,8 +23,9 @@ set -euo pipefail
 
 BUNDLE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${BUNDLE_DIR}/.env"
-COMPOSE_FILE="${BUNDLE_DIR}/docker-compose.yml"
 VERSION_FILE="${BUNDLE_DIR}/VERSION"
+# NOTE: the compose -f arguments are computed per-action by ha_compose_files (it
+# merges the HA overlay under HA), so there is no single fixed COMPOSE_FILE here.
 
 # Override points (kept as env so tests and mirrors can redirect them).
 GITHUB_REPO="${TARANAC_GITHUB_REPO:-taranaclabs/taranac}"
@@ -45,6 +46,14 @@ FRAMEWORK_FILES=(
     .env.example
     VERSION
     postgres-initdb
+    # HA (Pro) framework — refreshed so an HA operator's overlay/tooling/runbook stay
+    # current with the images (a stale overlay against new images is its own footgun).
+    # Absent from an older bundle's extract → cmd_apply's `[ -e ]` guard skips them.
+    docker-compose.ha.yml
+    docker-compose.witness.yml
+    ha-convert.sh
+    ha-join.sh
+    HA.md
 )
 
 c_bold=$'\033[1m'; c_green=$'\033[32m'; c_yellow=$'\033[33m'; c_red=$'\033[31m'; c_dim=$'\033[2m'; c_reset=$'\033[0m'
@@ -53,6 +62,51 @@ ok()     { printf '%s\n' "${c_green}✓${c_reset} $*"; }
 warn()   { printf '%s\n' "${c_yellow}!${c_reset} $*"; }
 notice() { printf '%s\n' "${c_dim}· $*${c_reset}"; }
 die()    { printf '%s\n' "${c_red}✗ $*${c_reset}" >&2; exit 1; }
+
+# ── HA overlay awareness (split-brain guard) ─────────────────────────
+# Under HA the database is Patroni-managed via docker-compose.ha.yml (applied on top
+# of the base compose). `pull`/`up -d` on the BASE compose alone would start a plain
+# `postgres` on the Patroni-managed data dir — on the primary a 2nd writable
+# standalone → split-brain / data loss, from a routine `./taranac update`. So when HA
+# is configured we ALWAYS merge the overlay for the bundle at $1. update always
+# (re)starts containers, so a missing overlay under HA is a hard refusal — never
+# base-only. Sets COMPOSE_FILES (full paths) + HA_ACTIVE.
+#
+# Detection (ha.md §13 A) fails TOWARD the overlay: the explicit TARANAC_HA=1 marker
+# (written by ha-convert.sh / ha-join.sh) is authoritative; ANY uncommented non-empty
+# DB_HOSTS is the defense-in-depth fallback (robust to `export `/spaces/quotes; the
+# value is never parsed). Mirrors the helper in ./taranac (kept self-contained).
+ha_is_configured() {  # $1 = path to .env; 0 = HA, 1 = standalone
+    local env="$1"
+    [ -f "${env}" ] || return 1
+    if grep -Eq '^[[:space:]]*(export[[:space:]]+)?TARANAC_HA[[:space:]]*=[[:space:]]*"?1"?[[:space:]]*$' "${env}"; then
+        return 0
+    fi
+    if grep -Eiq '^[[:space:]]*(export[[:space:]]+)?DB_HOSTS[[:space:]]*=[[:space:]]*"?[^"[:space:]#]' "${env}"; then
+        return 0
+    fi
+    return 1
+}
+
+ha_compose_files() {
+    local dir="$1"
+    COMPOSE_FILES=(-f "${dir}/docker-compose.yml")
+    HA_ACTIVE=0
+    ha_is_configured "${dir}/.env" || return 0    # standalone → base compose only
+    [ -f "${dir}/docker-compose.ha.yml" ] || die "HA is configured in .env but docker-compose.ha.yml is missing in ${dir} — refusing to pull/restart on the base compose alone (under HA that starts a 2nd writable Postgres on the Patroni data dir → split-brain). Update --from a full bundle tarball that ships the HA overlay."
+    COMPOSE_FILES=(-f "${dir}/docker-compose.yml" -f "${dir}/docker-compose.ha.yml")
+    HA_ACTIVE=1
+}
+
+# Remind the operator of the one-node-at-a-time discipline when restarting an HA node.
+ha_upgrade_notice() {
+    [ "${HA_ACTIVE:-0}" = "1" ] || return 0
+    echo
+    warn "HA node — the database comes up under the Patroni overlay."
+    notice "Upgrade ONE node at a time: replicas FIRST, the primary LAST (recreating the"
+    notice "primary's container triggers a failover). Back up first. (HA.md §6 / ha.md §6)"
+    echo
+}
 
 # ── Version helpers ──────────────────────────────────────────────────
 current_version() {
@@ -129,9 +183,11 @@ update_images_only() {
     grep -q '^APP_VERSION=' "${ENV_FILE}" && sed -i -E "s/^APP_VERSION=.*/APP_VERSION=${target}/" "${ENV_FILE}"
     ok "Pinned TARANAC_VERSION=${target} in .env"
     if [ "${do_restart}" = "1" ]; then
+        ha_compose_files "${BUNDLE_DIR}"           # merges the HA overlay under HA (or dies if missing)
+        ha_upgrade_notice
         info "Pulling images and restarting (migrations run automatically on api start) ..."
-        docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" pull
-        docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" up -d
+        docker compose --env-file "${ENV_FILE}" "${COMPOSE_FILES[@]}" pull
+        docker compose --env-file "${ENV_FILE}" "${COMPOSE_FILES[@]}" up -d
         ok "Images updated → ${target} (framework files left unchanged)."
     else
         notice "Skipped image pull / restart (--no-restart). Apply later with: ./taranac up -d"
@@ -147,7 +203,7 @@ cmd_apply() {
     local src="$1" dest="$2" target_ver="$3" do_restart="$4"
     [ -d "${src}" ] || die "internal: extracted bundle dir not found: ${src}"
     [ -d "${dest}" ] || die "internal: target bundle dir not found: ${dest}"
-    local env_file="${dest}/.env" compose_file="${dest}/docker-compose.yml"
+    local env_file="${dest}/.env"
 
     local stamp backup
     stamp="$(date +%Y%m%d-%H%M%S 2>/dev/null || echo manual)"
@@ -168,7 +224,8 @@ cmd_apply() {
         fi
     done
     chmod +x "${dest}/taranac" "${dest}/taranac-update.sh" \
-             "${dest}/install.sh" "${dest}/bootstrap.sh" 2>/dev/null || true
+             "${dest}/install.sh" "${dest}/bootstrap.sh" \
+             "${dest}/ha-convert.sh" "${dest}/ha-join.sh" 2>/dev/null || true
     ok "Bundle files updated."
 
     # Surface new .env settings without ever editing the operator's .env silently.
@@ -182,9 +239,11 @@ cmd_apply() {
     fi
 
     if [ "${do_restart}" = "1" ]; then
+        ha_compose_files "${dest}"                 # merges the just-refreshed HA overlay under HA
+        ha_upgrade_notice
         info "Pulling images and restarting (migrations run automatically on api start) ..."
-        docker compose --env-file "${env_file}" -f "${compose_file}" pull
-        docker compose --env-file "${env_file}" -f "${compose_file}" up -d
+        docker compose --env-file "${env_file}" "${COMPOSE_FILES[@]}" pull
+        docker compose --env-file "${env_file}" "${COMPOSE_FILES[@]}" up -d
         ok "Stack updated."
     else
         notice "Skipped image pull / restart (--no-restart). Apply later with: ./taranac up -d"

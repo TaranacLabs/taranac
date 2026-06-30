@@ -1,0 +1,96 @@
+# =============================================================================
+# Taranac — HA (Pro) overlay (docs/guide/ha.md §7.1 / §13).
+#
+# Converts the standalone DB layer to a self-managing Patroni + etcd cluster. Apply
+# it ON TOP of the base compose, on EVERY DB node (each node runs the full stack):
+#
+#   docker compose --env-file .env -f docker-compose.yml -f docker-compose.ha.yml up -d
+#
+# The WITNESS host runs only docker-compose.witness.yml (a 3rd etcd voting member in
+# a SEPARATE failure domain — MANDATORY for a 2-node cluster, ha.md §8).
+#
+# What it changes:
+#   • `postgres` → the taranac-postgres-ha image (Patroni-supervised Postgres 16).
+#     It ADOPTS an existing standalone PGDATA in place (no re-init) or initdb's a
+#     fresh node. Same service NAME so every `@postgres` DSN stays node-local.
+#   • adds a co-located `etcd` member (the DCS).
+#   • publishes 5432/8008 (Postgres + Patroni REST) and 2379/2380 (etcd) so the
+#     OTHER node + the witness can reach this one.
+#
+# The api + daemons need NO change here: they already read DB_HOSTS from .env
+# (writes route to the current primary) and connect to the node-local `@postgres`
+# for reads (§2/§3). Set DB_HOSTS + the HA block in .env.
+#
+# ⚠️ SECURITY: etcd here speaks plaintext http (no TLS/auth) — the same model the
+# spike + Tier-2 quorum validation used. etcd holds the cluster control state, so
+# its ports (2379/2380) MUST be firewalled to the cluster's PRIVATE interconnect and
+# never exposed publicly (runbook). etcd mutual TLS is a tracked hardening follow-on.
+# =============================================================================
+services:
+  # ── etcd — the DCS (one voting member per DB node; the witness adds the 3rd) ──
+  etcd:
+    container_name: taranac-etcd
+    image: quay.io/coreos/etcd:v3.5.17
+    # etcd reads ETCD_* env natively. ETCD_NAME + the full ETCD_INITIAL_CLUSTER
+    # member list come from .env (identical list on every member; each node sets
+    # its own ETCD_NAME). A 2-node cluster MUST list the 3rd witness member.
+    environment:
+      ETCD_NAME: ${ETCD_NAME}
+      ETCD_DATA_DIR: /etcd-data
+      ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+      ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://${NODE_ADDRESS}:2380
+      ETCD_ADVERTISE_CLIENT_URLS: http://${NODE_ADDRESS}:2379
+      ETCD_INITIAL_CLUSTER: ${ETCD_INITIAL_CLUSTER}
+      ETCD_INITIAL_CLUSTER_STATE: ${ETCD_INITIAL_CLUSTER_STATE:-new}
+      ETCD_INITIAL_CLUSTER_TOKEN: ${TARANAC_CLUSTER_NAME}
+    ports:
+      - "2379:2379"
+      - "2380:2380"
+    volumes:
+      - etcd_data:/etcd-data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ── postgres → Patroni-supervised Postgres 16 (same service name) ──────────
+  postgres:
+    image: ${IMAGE_PREFIX}/postgres-ha:${TARANAC_VERSION}
+    # Drop the standalone `postgres -c …` command — Patroni owns the conf (it carries
+    # the identical §6.7 baseline in its bootstrap config). The image's entrypoint
+    # renders the Patroni config from the env below and execs Patroni.
+    command: []
+    environment:
+      # Per-node identity + DCS wiring (envsubst'd into the Patroni config).
+      PATRONI_NAME: ${TARANAC_NODE_NAME}
+      PATRONI_SCOPE: ${TARANAC_CLUSTER_NAME}
+      NODE_ADDRESS: ${NODE_ADDRESS}
+      ETCD_HOSTS: ${ETCD_HOSTS}
+      # The app role IS the Postgres superuser (matches the standalone image) — one
+      # password, the same the app connects with. This is what lets Patroni adopt an
+      # existing standalone PGDATA in place (that role is its only superuser).
+      PGPW: ${POSTGRES_PASSWORD}
+      # The replicator role password (== the standalone POSTGRES_REPLICATION_PASSWORD).
+      REPLPW: ${POSTGRES_REPLICATION_PASSWORD}
+      # pg_hba TCP scope — NARROW to the cluster's private subnet (default: broad).
+      PG_ALLOW_CIDR: ${PG_ALLOW_CIDR:-0.0.0.0/0}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"   # the other node + its daemons reach this DB
+      - "8008:8008"                      # Patroni REST (patronictl / the slot reaper)
+    depends_on:
+      etcd:
+        condition: service_healthy
+    # Patroni manages Postgres; pg_isready confirms it is accepting connections.
+    # Generous start_period covers initdb/adoption + bootstrap on a fresh node.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U taranac"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 90s
+
+volumes:
+  etcd_data: {}

@@ -15,6 +15,11 @@
 #   ./taranac reset-password admin   # reset a forgotten web-admin password
 #   ./taranac create-admin           # recover/guarantee an admin login (create-or-repair)
 #
+#   ./taranac installation-id        # print the installation_id (to obtain a Pro license)
+#
+#   ./taranac cluster status                              # HA: nodes + replication health
+#   ./taranac cluster join-token --name node-2 --address 10.0.0.2   # HA: issue a join token
+#
 #   ./taranac reset                  # show what a factory reset would do (no changes)
 #   ./taranac reset --confirm RESET  # factory-reset the system (demo/dev only; auto-backup first)
 #
@@ -28,7 +33,56 @@ cd "${HERE}"
 
 # NOTE: invoke docker directly with `exec docker compose …`. `exec` replaces the
 # shell with an external program and cannot run a shell function, so a `compose()`
-# helper would fail here with "exec: compose: not found".
+# helper would fail here with "exec: compose: not found". (Computing the compose-file
+# list in a function and THEN `exec docker compose "${COMPOSE_FILES[@]}"` is fine —
+# the function runs to completion before exec replaces the shell.)
+
+# ── HA overlay awareness (split-brain guard) ────────────────────────────────
+# Under HA the database is Patroni-managed via docker-compose.ha.yml, applied ON TOP
+# of the base compose. Acting on the BASE compose alone would start a second, plain
+# `postgres` on the Patroni-managed data directory — on the primary that is a 2nd
+# writable standalone → split-brain / data loss. So when HA is configured we ALWAYS
+# merge the overlay. If HA is configured but the overlay file is gone, refuse any
+# container-STARTING command (the dangerous ones) rather than silently run base-only;
+# for read-only/diagnostic commands warn but proceed so recovery is never blocked.
+#
+# HA detection (ha.md §13 A) deliberately fails TOWARD the overlay — every miss must
+# be a loud broken start, never a silent split-brain. The authoritative signal is the
+# explicit `TARANAC_HA=1` marker that ha-convert.sh / ha-join.sh write on conversion
+# (unforgeable, no value to mis-parse). As a defense-in-depth fallback we also treat
+# ANY uncommented, non-empty DB_HOSTS as HA — robust to `export `, spaces around `=`,
+# and quotes; we never parse the value or trust the "last" line.
+ha_is_configured() {  # $1 = path to .env; 0 = HA, 1 = standalone
+  local env="$1"
+  [ -f "${env}" ] || return 1
+  if grep -Eq '^[[:space:]]*(export[[:space:]]+)?TARANAC_HA[[:space:]]*=[[:space:]]*"?1"?[[:space:]]*$' "${env}"; then
+    return 0
+  fi
+  if grep -Eiq '^[[:space:]]*(export[[:space:]]+)?DB_HOSTS[[:space:]]*=[[:space:]]*"?[^"[:space:]#]' "${env}"; then
+    return 0
+  fi
+  return 1
+}
+
+ha_compose_files() {  # $1 = the passthrough subcommand; sets the COMPOSE_FILES array
+  COMPOSE_FILES=(-f docker-compose.yml)
+  ha_is_configured .env || return 0         # standalone → base compose only
+  if [ -f docker-compose.ha.yml ]; then
+    COMPOSE_FILES=(-f docker-compose.yml -f docker-compose.ha.yml)
+    return 0
+  fi
+  case "${1:-}" in
+    up|start|restart|run|create)
+      echo "✗ HA is configured (DB_HOSTS is set in .env) but docker-compose.ha.yml is missing." >&2
+      echo "  Refusing '${1}' on the base compose alone: under HA that starts a second writable" >&2
+      echo "  Postgres on the Patroni-managed data directory → split-brain / data loss." >&2
+      echo "  Restore the overlay from the bundle ('./taranac update'), then retry." >&2
+      exit 1 ;;
+    *)
+      echo "! HA is configured but docker-compose.ha.yml is missing — acting on the base compose" >&2
+      echo "  only. Restore it with './taranac update'." >&2 ;;
+  esac
+}
 
 case "${1:-}" in
   # Convenience subcommands handled by the wrapper, not passed to compose:
@@ -54,6 +108,14 @@ case "${1:-}" in
     exec docker compose --env-file .env -f docker-compose.yml exec -T api \
       python -m app.scripts.create_admin "$@"
     ;;
+  installation-id)
+    # Print this install's immutable installation_id — the value to bind a Pro
+    # license to (send it to TaranacLabs to have a .lic issued).
+    [ -f .env ] || { echo "No .env found — run ./install.sh first." >&2; exit 1; }
+    shift
+    exec docker compose --env-file .env -f docker-compose.yml exec -T api \
+      python -m app.scripts.show_installation_id "$@"
+    ;;
   reset)
     # Factory-reset the system (demo stands). Wipes all data and restores the
     # fresh-install state. Guarded by APP_ENV (demo/dev only) + an explicit
@@ -62,6 +124,19 @@ case "${1:-}" in
     shift
     exec docker compose --env-file .env -f docker-compose.yml exec -T api \
       python -m app.scripts.system_reset "$@"
+    ;;
+  cluster)
+    # HA cluster operations (Pro): status, issue/redeem/revoke join tokens.
+    #   ./taranac cluster status
+    #   ./taranac cluster join-token --name node-2 --address 10.0.0.2
+    #   ./taranac cluster register --token <secret>
+    # Converting to HA / adding a node is out-of-band — see ha-convert.sh (the seed)
+    # and ha-join.sh (a new node; Patroni clones it). This only issues/redeems tokens
+    # and reports status.
+    [ -f .env ] || { echo "No .env found — run ./install.sh first." >&2; exit 1; }
+    shift
+    exec docker compose --env-file .env -f docker-compose.yml exec -T api \
+      python -m app.scripts.cluster "$@"
     ;;
   version|update)
     # Self-update: refreshes BOTH images and the bundle files (this wrapper,
@@ -76,4 +151,5 @@ case "${1:-}" in
 esac
 
 [ -f .env ] || { echo "No .env found — run ./install.sh first." >&2; exit 1; }
-exec docker compose --env-file .env -f docker-compose.yml "$@"
+ha_compose_files "${1:-}"
+exec docker compose --env-file .env "${COMPOSE_FILES[@]}" "$@"

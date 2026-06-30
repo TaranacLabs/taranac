@@ -28,16 +28,20 @@ check() { if eval "$2"; then ok "$1"; else bad "$1 — [$2]"; fi; }
 NEW_VER="1.0.0-rc2"
 OLD_VER="1.0.0-rc1"
 
-FRAMEWORK=(taranac taranac-update.sh docker-compose.yml install.sh bootstrap.sh INSTALL.md README.md .env.example VERSION postgres-initdb)
+FRAMEWORK=(taranac taranac-update.sh docker-compose.yml install.sh bootstrap.sh INSTALL.md README.md .env.example VERSION postgres-initdb docker-compose.ha.yml docker-compose.witness.yml ha-convert.sh ha-join.sh HA.md)
 
 # ── 1. Build a realistic "new" bundle tarball from the real dist files ───────
 echo "==> Building bundle tarball (mirrors what release.yml ships)"
-BUNDLE_SRC="${WORK}/bundle-src"
+# Stage into a versioned top-level dir, exactly like build-bundle.sh / release.yml
+# ship it, so this run also exercises the updater's top-level-dir normalisation
+# (taranac-update.sh strips the single wrapping folder on extract).
+PREFIX="taranac-${NEW_VER}"
+BUNDLE_SRC="${WORK}/bundle-src/${PREFIX}"
 mkdir -p "${BUNDLE_SRC}"
 for f in "${FRAMEWORK[@]}"; do cp -a "${DIST_DIR}/${f}" "${BUNDLE_SRC}/"; done
 printf '%s\n' "${NEW_VER}" > "${BUNDLE_SRC}/VERSION"
 TARBALL="taranac-bundle-${NEW_VER}.tar.gz"
-( cd "${BUNDLE_SRC}" && tar -czf "${WORK}/${TARBALL}" "${FRAMEWORK[@]}" )
+( cd "${WORK}/bundle-src" && tar -czf "${WORK}/${TARBALL}" "${PREFIX}" )
 ( cd "${WORK}" && sha256sum "${TARBALL}" > SHA256SUMS )
 
 # ── 2. Serve a GitHub-Releases-shaped layout over real HTTP ──────────────────
@@ -112,6 +116,9 @@ check ".env MASTER_KEY preserved"                            "grep -qF '${SECRET
 check ".env POSTGRES_PASSWORD preserved"                     "grep -q '^POSTGRES_PASSWORD=operator-db-password\$' '${INST}/.env'"
 check ".env TRUSTED_PROXY_HOPS (operator value) preserved"   "grep -q '^TRUSTED_PROXY_HOPS=2\$' '${INST}/.env'"
 check "operator TLS cert untouched"                          "[ \"\$(cat '${INST}/config/tls/tls.crt')\" = 'OPERATOR-CERT-CONTENT' ]"
+check "HA overlay refreshed into the bundle (framework file)"     "[ -f '${INST}/docker-compose.ha.yml' ]"
+check "HA runbook refreshed into the bundle (framework file)"     "[ -f '${INST}/HA.md' ]"
+check "ha-convert.sh refreshed + executable"                      "[ -x '${INST}/ha-convert.sh' ]"
 check "backup directory created"                             "ls -d '${INST}'/.taranac-backup-* >/dev/null 2>&1"
 check "backup holds the OLD wrapper"                         "grep -rq 'OLD wrapper' '${INST}'/.taranac-backup-*/taranac"
 # The new-key diff lists keys the operator LACKS; keys they already have must be

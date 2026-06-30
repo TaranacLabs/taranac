@@ -258,13 +258,44 @@ services:
   postgres:
     container_name: taranac-db
     image: postgres:16-alpine
+    # Replication-ready baseline (HA, docs/guide/ha.md §6.7 / D6). Inert on a
+    # single node; baking it in now makes converting to HA a config overlay, not a
+    # re-init. The repl-ready conf below applies on every start; --data-checksums
+    # and the replicator role apply ONLY on a fresh data dir (initdb) — an existing
+    # install needs offline pg_checksums + a manual replicator role before going HA.
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=replica"
+      - "-c"
+      - "max_wal_senders=10"
+      - "-c"
+      - "max_replication_slots=10"
+      - "-c"
+      - "hot_standby=on"
+      - "-c"
+      - "wal_log_hints=on"
+      - "-c"
+      - "wal_keep_size=512MB"
+      # Disk backstop for replication slots — inert without slots, LOAD-BEARING under
+      # Patroni/HA (which gives every replica a slot). Caps the WAL a single slot may
+      # pin, so an orphaned/decommissioned slot can never fill the disk: past this size
+      # Postgres invalidates the slot (wal_status='lost') instead of hoarding WAL.
+      # Generous vs the §9 write volume (~10–20/s) so a legitimate replica never trips
+      # it; the orphan-slot reaper (ha.md §10.2) reclaims any invalidated slot.
+      - "-c"
+      - "max_slot_wal_keep_size=2GB"
     environment:
       POSTGRES_DB: taranac
       POSTGRES_USER: taranac
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+      # The replicator role's password (used by a joining replica's pg_basebackup).
+      POSTGRES_REPLICATION_PASSWORD: ${POSTGRES_REPLICATION_PASSWORD:-}
     volumes:
       - pg_data:/var/lib/postgresql/data
-      # Creates the taranac_mfa database on first init (no-op on an existing DB).
+      # First-init only: 05 = replicator role + pg_hba (HA baseline); 10 = the
+      # taranac_mfa database. Both no-ops on an already-initialised data dir.
       - ./postgres-initdb:/docker-entrypoint-initdb.d:ro
     restart: unless-stopped
     healthcheck:

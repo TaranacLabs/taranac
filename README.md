@@ -76,6 +76,35 @@ one-time password; the account is asked to change it at next login):
 ./taranac reset-password admin
 ```
 
+## Activating a Pro license
+
+Pro features are unlocked by an **offline, signed license file** — no phone-home.
+Taranac Community runs fully without one.
+
+1. Get this installation's **Installation ID** (shown on **Settings → System →
+   Licensing** in the UI, or from the console):
+
+   ```bash
+   ./taranac installation-id
+   ```
+
+2. Send the Installation ID to TaranacLabs; you receive a `.lic` file bound to it.
+3. Upload the `.lic` on **Settings → System → Licensing**. Done — no network call
+   leaves the install.
+
+The license is verified locally; an invalid or wrong-installation file is rejected
+and never disables the running system.
+
+## High Availability (Pro)
+
+Run Taranac as a 2–4 node cluster: one read-write primary plus read-only replicas,
+automatic failover, and authentication that keeps serving on every node even
+during a failover. HA is a Pro feature, layered on an existing single-node install
+with the bundled `ha-convert.sh` / `ha-join.sh` scripts (a witness host is
+required for a 2-node cluster).
+
+**Full deploy + operate runbook: [HA.md](HA.md).**
+
 ## Upgrade to a new version
 
 One command updates **both** the container images and the bundle files (this

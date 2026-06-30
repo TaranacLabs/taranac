@@ -1,0 +1,49 @@
+# =============================================================================
+# Taranac — HA witness (Pro) — docs/guide/ha.md §8.
+#
+# A 2-node Taranac HA cluster CANNOT safely auto-fail-over on its own: a partition
+# splits the two DB nodes 1-vs-1 with no majority, so neither may safely become the
+# primary (split-brain). The tiebreaker is a 3rd etcd VOTING member (an arbiter) —
+# it runs NO Postgres, just etcd, and MUST live in a SEPARATE failure domain (a 3rd
+# host/VM, ideally a different rack/site). Co-locating it with a DB node is useless:
+# losing that host loses both a DB node AND the tiebreaker at once.
+#
+# Run on the witness HOST only:
+#   docker compose --env-file .env -f docker-compose.witness.yml up -d
+#
+# Its .env needs just the etcd block (ETCD_NAME=witness, the same ETCD_INITIAL_CLUSTER
+# member list as the DB nodes, NODE_ADDRESS=this host's address, TARANAC_CLUSTER_NAME).
+#
+# ⚠️ SECURITY: plaintext http etcd — firewall 2379/2380 to the cluster's private
+# interconnect only (see docker-compose.ha.yml). etcd mutual TLS is a hardening item.
+# =============================================================================
+name: taranac-witness
+
+services:
+  etcd:
+    container_name: taranac-witness-etcd
+    image: quay.io/coreos/etcd:v3.5.17
+    environment:
+      ETCD_NAME: ${ETCD_NAME:-witness}
+      ETCD_DATA_DIR: /etcd-data
+      ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+      ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://${NODE_ADDRESS}:2380
+      ETCD_ADVERTISE_CLIENT_URLS: http://${NODE_ADDRESS}:2379
+      ETCD_INITIAL_CLUSTER: ${ETCD_INITIAL_CLUSTER}
+      ETCD_INITIAL_CLUSTER_STATE: ${ETCD_INITIAL_CLUSTER_STATE:-new}
+      ETCD_INITIAL_CLUSTER_TOKEN: ${TARANAC_CLUSTER_NAME}
+    ports:
+      - "2379:2379"
+      - "2380:2380"
+    volumes:
+      - etcd_data:/etcd-data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  etcd_data: {}

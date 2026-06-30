@@ -24,7 +24,18 @@ use `taranac.example.com`.)
 
 ## 2. Get the bundle
 
-Download the deployment bundle and enter its directory:
+Pick either way and enter the bundle directory.
+
+**Option A — release tarball** (pinned to a specific version; works offline once
+downloaded). Grab `taranac-bundle-<ver>.tar.gz` from the
+[Releases page](https://github.com/TaranacLabs/taranac/releases/latest), then:
+
+```bash
+tar xf taranac-bundle-<ver>.tar.gz   # unpacks into its own folder taranac-<ver>/
+cd taranac-<ver>
+```
+
+**Option B — git clone** (always the latest bundle scripts):
 
 ```bash
 git clone https://github.com/TaranacLabs/taranac.git
@@ -32,7 +43,8 @@ cd taranac
 ```
 
 The bundle contains only configuration — no product source. The application
-ships as Docker images that the steps below pull automatically.
+ships as Docker images that the steps below pull automatically; their version is
+read from the bundle's `VERSION` file, so `install.sh` never asks for a tag.
 
 ---
 
@@ -200,6 +212,19 @@ On an older bundle that has no `update` yet, copy `taranac` + `taranac-update.sh
 from the new bundle once, then it is self-maintaining.
 
 (Take a backup from the in-app Backup & Recovery tools before upgrading.)
+
+---
+
+## 9. High Availability (Pro)
+
+Run Taranac as a 2–4 node cluster — one read-write primary plus read-only
+replicas, with automatic failover, where authentication keeps serving on every
+node even while a failover happens. HA is a Pro feature (it needs an HA license)
+and is layered on top of an existing single-node install with the bundled
+`ha-convert.sh` / `ha-join.sh` scripts.
+
+**The full deploy + operate runbook is [HA.md](HA.md).** Start there before
+touching any HA setting.
 
 ---
 
