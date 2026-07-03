@@ -14,10 +14,20 @@ is everything you need to run Taranac from published Docker images — no source
 
 ## Install
 
+Copy-paste on a fresh host — download, unpack, install Docker, start Taranac:
+
 ```bash
-sudo bash bootstrap.sh   # installs Docker + compose if missing (skip if present)
-                         # then log out/in so the docker group applies
-./install.sh             # configures + starts Taranac
+# 1 — download and unpack the latest release
+curl -fsSL -O https://github.com/TaranacLabs/taranac/releases/latest/download/taranac-bundle-1.0.3.tar.gz
+tar xf taranac-bundle-1.0.3.tar.gz
+cd taranac-1.0.3
+
+# 2 — install Docker + compose plugin (skips if already present), then log out and
+#     back in so the docker group applies (or run: newgrp docker)
+sudo bash bootstrap.sh
+
+# 3 — configure + start Taranac (asks for domain + admin, generates every secret)
+./install.sh
 ```
 
 `install.sh` asks for your domain and admin details, **generates every secret**,
