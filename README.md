@@ -18,9 +18,9 @@ Copy-paste on a fresh host — download, unpack, install Docker, start Taranac:
 
 ```bash
 # 1 — download and unpack the latest release
-curl -fsSL -O https://github.com/TaranacLabs/taranac/releases/latest/download/taranac-bundle-1.0.3.tar.gz
-tar xf taranac-bundle-1.0.3.tar.gz
-cd taranac-1.0.3
+curl -fsSL -O https://github.com/TaranacLabs/taranac/releases/latest/download/taranac-bundle.tar.gz
+tar xf taranac-bundle.tar.gz
+cd taranac-*/
 
 # 2 — install Docker + compose plugin (skips if already present), then log out and
 #     back in so the docker group applies (or run: newgrp docker)
