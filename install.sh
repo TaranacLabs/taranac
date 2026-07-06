@@ -45,9 +45,36 @@ for arg in "$@"; do
 done
 
 # ── Prerequisites ────────────────────────────────────────────────────
-command -v docker  >/dev/null 2>&1 || die "docker is not installed."
-command -v openssl >/dev/null 2>&1 || die "openssl is not installed."
-docker compose version >/dev/null 2>&1 || die "the docker compose plugin is not available."
+command -v docker  >/dev/null 2>&1 || die "docker is not installed. Run:  sudo bash bootstrap.sh"
+command -v openssl >/dev/null 2>&1 || die "openssl is not installed. Run:  sudo bash bootstrap.sh"
+docker compose version >/dev/null 2>&1 || die "the docker compose plugin is not available. Run:  sudo bash bootstrap.sh"
+
+# `docker` on PATH does NOT prove this shell can reach the daemon. The #1 first-run
+# failure: bootstrap.sh added the user to the `docker` group, but group membership only
+# applies to a NEW login shell — so in the SAME shell every docker call fails with a
+# permission-denied on /var/run/docker.sock. Detect that exact case and give the one
+# instruction that fixes it, instead of dying midway with a cryptic socket error.
+if ! docker version >/dev/null 2>&1; then
+    in_group_db=0    # docker is in the user's groups per the group database (after re-login)
+    in_group_now=0   # docker is in THIS shell's active groups (usable right now)
+    if id -nG "$(id -un)" 2>/dev/null | tr ' ' '\n' | grep -qx docker; then in_group_db=1; fi
+    if id -nG          2>/dev/null | tr ' ' '\n' | grep -qx docker; then in_group_now=1; fi
+
+    if [ "$(id -u)" -ne 0 ] && [ "${in_group_db}" -eq 1 ] && [ "${in_group_now}" -eq 0 ]; then
+        printf '%s\n' "${c_red}${c_bold}╔══════════════════════════════════════════════════════════════════╗${c_reset}" >&2
+        printf '%s\n' "${c_red}${c_bold}║  STOP — you need to start a new login session first.              ║${c_reset}" >&2
+        printf '%s\n' "${c_red}${c_bold}╚══════════════════════════════════════════════════════════════════╝${c_reset}" >&2
+        printf '%s\n' "  You ARE in the 'docker' group, but THIS terminal hasn't picked it" >&2
+        printf '%s\n' "  up yet — group membership only applies to a NEW login session." >&2
+        printf '%s\n' "" >&2
+        printf '%s\n' "  Do ONE of these, then run  ./install.sh  again:" >&2
+        printf '%s\n' "     ${c_bold}• log out and log back in${c_reset}, or" >&2
+        printf '%s\n' "     ${c_bold}• run:   newgrp docker${c_reset}" >&2
+        exit 1
+    fi
+    die "Cannot reach the Docker daemon. Make sure it is installed and running, and that
+   your user may access it:  sudo bash bootstrap.sh"
+fi
 
 # Merge the HA overlay when this node is configured for HA. install.sh is also the
 # documented UPGRADE command, so on a converted node it must NOT bring the stack up on
@@ -194,14 +221,22 @@ TARANAC_NODE_NAME=taranac-node-1
 #NODE_ADDRESS=10.0.0.1
 #PG_ALLOW_CIDR=10.0.0.0/24
 #ETCD_NAME=taranac-node-1
-#ETCD_INITIAL_CLUSTER=taranac-node-1=http://10.0.0.1:2380,taranac-node-2=http://10.0.0.2:2380,witness=http://10.0.0.3:2380
+#ETCD_INITIAL_CLUSTER=taranac-node-1=https://10.0.0.1:2380,taranac-node-2=https://10.0.0.2:2380,witness=https://10.0.0.3:2380
 #ETCD_INITIAL_CLUSTER_STATE=new
 #ETCD_HOSTS=10.0.0.1:2379,10.0.0.2:2379,10.0.0.3:2379
+# Secure etcd (peer auto-TLS + one-way client TLS) is the DEFAULT (#30). You do NOT hand-set
+# the TLS knobs — 'ha-convert.sh --prepare'/'--continue' (seed) generates the CA + per-node
+# certs, enables peer auto-TLS, and rewrites the member URLs above to https://; 'ha-join.sh
+# --primary' makes each node follow. The etcd CA + mfa key travel OOB in the "cluster secret
+# set" (ha.md §7.3/§12). To opt DOWN to plaintext, run 'ha-convert.sh --plaintext'.
+# ⚠️ FIREWALL 2379/2380 to the private interconnect either way. Live migration: ha.md §7.2/§7.3.
+#ETCD_PEER_SCHEME=https
+#ETCD_PEER_AUTO_TLS=true
+#ETCD_CLIENT_SCHEME=https
 
 APP_HOST=0.0.0.0
 APP_PORT=8000
 APP_NAME=taranac
-APP_VERSION=${TARANAC_VERSION}
 APP_ENV=production
 DOCS_ENABLED=false
 
@@ -223,7 +258,7 @@ INTERNAL_TLS_VERIFY=true
 
 LOG_LEVEL=INFO
 LOG_OUTPUT=stdout
-SUPPORTED_LOCALES=en,ru
+SUPPORTED_LOCALES=en,de,es,fr,pt
 
 TACACS_PORT=49
 TACACS_TLS_PORT=6049
@@ -256,8 +291,12 @@ umask 022
 ok ".env written (mode 600)."
 
 # ── Prepare operator config directories ──────────────────────────────
-mkdir -p "${SCRIPT_DIR}/config/tls" "${SCRIPT_DIR}/config/firebase"
-ok "Created config/tls/ (drop tls.crt + tls.key here) and config/firebase/."
+# config/etcd-tls is the RO bind-mount source for the HA etcd client-TLS material
+# (ca.crt + this node's etcd server leaf). Created empty + inert; ha-convert/ha-join
+# populate it only when client-TLS is enabled (ha.md §7.3). Present-but-empty keeps the
+# HA overlay's bind mount valid on an http (default) cluster.
+mkdir -p "${SCRIPT_DIR}/config/tls" "${SCRIPT_DIR}/config/firebase" "${SCRIPT_DIR}/config/etcd-tls"
+ok "Created config/tls/ (drop tls.crt + tls.key here), config/firebase/, and config/etcd-tls/."
 
 # ── Pull and start ───────────────────────────────────────────────────
 resolve_compose_files          # standalone here (DB_HOSTS commented) → base compose only

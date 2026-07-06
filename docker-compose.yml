@@ -60,7 +60,7 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://taranac:${POSTGRES_PASSWORD}@postgres:5432/taranac
       MONITORING_HOST_ROOT: /host
-      SUPPORTED_LOCALES: "${SUPPORTED_LOCALES:-en,ru}"
+      SUPPORTED_LOCALES: "${SUPPORTED_LOCALES:-en,de,es,fr,pt}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -102,6 +102,11 @@ services:
       TARANAC_MFA_API_KEY: ${TARANAC_MFA_API_KEY}
       TARANAC_MFA_DATABASE_URL: postgresql://taranac:${POSTGRES_PASSWORD}@postgres:5432/taranac_mfa
       TARANAC_MFA_SECRET_KEY_FILE: /opt/taranac/data/enckey
+      # HA (Pro): the seed's shared mfa key (base64), provisioned by ha-convert/ha-join so
+      # Push tokens decrypt on every node (ha.md §12). Absent-only ⇒ the entrypoint honours
+      # an existing file and self-generates on a fresh standalone/DMZ node. Empty by default
+      # (single node / DMZ-standalone) ⇒ byte-identical to before.
+      TARANAC_MFA_ENCKEY: "${TARANAC_MFA_ENCKEY:-}"
       TARANAC_MFA_FIREBASE_JSON: /opt/taranac/firebase/firebase-credentials.json
       TARANAC_MFA_LOG_LEVEL: INFO
       TARANAC_MFA_LOG_FORMAT: json

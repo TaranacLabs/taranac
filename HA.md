@@ -77,7 +77,10 @@ section). Set the shared values identically everywhere:
 TARANAC_CLUSTER_NAME=taranac
 DB_HOSTS=10.0.0.1:5432,10.0.0.2:5432
 PG_ALLOW_CIDR=10.0.0.0/24
-ETCD_INITIAL_CLUSTER=taranac-node-1=http://10.0.0.1:2380,taranac-node-2=http://10.0.0.2:2380,witness=http://10.0.0.3:2380
+# https:// member URLs — the secure default (#30). On the DB nodes ha-convert --prepare
+# rewrites these for you; on the witness .env.witness.example ships them https. (Opting
+# down with ha-convert --plaintext? Use http:// here instead — §7.)
+ETCD_INITIAL_CLUSTER=taranac-node-1=https://10.0.0.1:2380,taranac-node-2=https://10.0.0.2:2380,witness=https://10.0.0.3:2380
 ETCD_HOSTS=10.0.0.1:2379,10.0.0.2:2379,10.0.0.3:2379
 ETCD_INITIAL_CLUSTER_STATE=new
 POSTGRES_REPLICATION_PASSWORD=<the same value node-1 already generated>
@@ -97,9 +100,12 @@ NODE_ADDRESS=10.0.0.1                # this node's address the others route to
 ETCD_NAME=taranac-node-1            # this node's etcd member name (= its key in ETCD_INITIAL_CLUSTER)
 ```
 
-The witness `.env` needs only the etcd block: `TARANAC_CLUSTER_NAME`, the same
-`ETCD_INITIAL_CLUSTER`, `ETCD_INITIAL_CLUSTER_STATE=new`, `ETCD_NAME=witness`,
-and `NODE_ADDRESS=<the witness host's address>`.
+The witness `.env` needs only the etcd block, and it ships **secure by default** in
+`.env.witness.example` (peer auto-TLS + one-way client TLS, matching the DB nodes — an
+http witness cannot join an https ring). On the witness host, `cp .env.witness.example .env`
+and set `TARANAC_CLUSTER_NAME`, the same `ETCD_INITIAL_CLUSTER` (`https://` member URLs) +
+`ETCD_INITIAL_CLUSTER_STATE=new`, `ETCD_NAME=witness`, and `NODE_ADDRESS=<the witness host's
+address>`. (Its client-TLS leaf is carried out-of-band — see [§7](#7-security--you-must-do-this).)
 
 > `DB_HOSTS` lists **every DB node's** Postgres endpoint. It is one cluster-wide
 > knob the API and all three daemons read so that writes always reach whichever
@@ -115,30 +121,61 @@ anything joins, or an empty joining node could win the bootstrap race and clone
 over your real data. (The tooling guards against this, but follow the order
 anyway.)
 
-### Step 1 — Bring up the witness etcd (on the witness host)
+**Secure etcd (peer auto-TLS + one-way client TLS) is the DEFAULT (#30), which makes
+the convert TWO-PHASE.** The witness must be a live etcd member *before* the real
+convert (convert prunes any not-yet-started member), but its TLS cert can only be
+signed by the CA the convert generates — a chicken-and-egg. So `--prepare` mints the
+CA + every member's cert first, the witness comes up with its cert, then `--continue`
+does the real convert. Full rationale + the plaintext opt-out are in
+[§7](#7-security--you-must-do-this); the ordered steps are:
+
+### Step 1 — PREPARE on node-1 (on your existing single node)
+
+`--prepare` generates the etcd CA + node-1's cert, enables peer auto-TLS, rewrites the
+member URLs to `https://`, pre-issues a cert for **every** other member into
+`config/cluster-secrets/etcd/<member>/`, writes the `https` knobs — and **stops** (node-1
+stays standalone). It does not touch your data yet.
 
 ```bash
+# Take a backup first (in-app Backup & Recovery) — the later adoption is in-place.
+./ha-convert.sh --prepare --node-name taranac-node-1 --node-address 10.0.0.1
+```
+
+### Step 2 — Bring up the witness etcd (on the witness host)
+
+The witness is **secure by default** — `cp .env.witness.example .env` and fill in the
+addresses (see [§3](#3-configure-the-cluster-env-every-node--the-witness)). Copy its
+pre-issued cert **out-of-band** and start it:
+
+```bash
+# From node-1: copy config/cluster-secrets/etcd/witness/ → the witness's config/etcd-tls/ (OOB — scp/USB)
 docker compose --env-file .env -f docker-compose.witness.yml up -d
 ```
 
-### Step 2 — Convert node-1 (on your existing single node)
+### Step 3 — CONTINUE on node-1 (back on the seed)
 
+Now that the witness is a live etcd member, `--continue` does the real convert:
 `ha-convert.sh` swaps node-1's database to the Patroni image, which **adopts your
-existing data in place** (no re-initialisation, no data loss) and brings node-1
-up as the primary that initialises the cluster.
+existing data in place** (no re-initialisation, no data loss), forms quorum with the
+witness, and brings node-1 up as the primary that initialises the cluster.
 
 ```bash
-# Take a backup first (in-app Backup & Recovery) — adoption is in-place.
-./ha-convert.sh --node-name taranac-node-1 --node-address 10.0.0.1
+./ha-convert.sh --continue
 ```
 
 The script waits until node-1 reports itself as primary, then prints the next
-commands. **This must finish before you join any node.** If it times out, etcd
-most likely has no quorum — confirm the witness from Step 1 is up and reachable.
+commands. **This must finish before you join any node.** If it times out, etcd most
+likely has no quorum — confirm the witness from Step 2 is up and reachable (`--continue`
+verifies quorum with the witness before it prunes, and refuses loudly otherwise).
 
-### Step 3 — Join each additional node
+> **Plaintext opt-out.** If your interconnect is already isolated and you want the
+> legacy **single-shot** convert, bring the witness up first (Step 2, with the plaintext
+> block in `.env.witness.example`) then run `./ha-convert.sh --plaintext --node-name
+> taranac-node-1 --node-address 10.0.0.1` — no `--prepare`/`--continue`, no certs. See §7.
 
-For **each** new node, do two things:
+### Step 4 — Join each additional node
+
+For **each** new node, do three things:
 
 **On node-1**, issue a join token:
 
@@ -147,26 +184,31 @@ For **each** new node, do two things:
 ```
 
 **On the new node**, first write its `.env` *without* starting a standalone stack
-(a started standalone would initialise the data volume and block the clone):
+(a started standalone would initialise the data volume and block the clone), and copy
+its pre-issued etcd cert out-of-band:
 
 ```bash
 ./install.sh --no-start
+# From node-1: copy config/cluster-secrets/etcd/taranac-node-2/ → this node's config/etcd-tls/ (OOB)
 ```
 
 Then fill its `.env` per [§3](#3-configure-the-cluster-env-every-node--the-witness),
-supply `MASTER_KEY` out-of-band and run the join:
+supply `MASTER_KEY` out-of-band and run the join with `--primary` (it fetches the
+cluster config from the seed and auto-follows the https scheme):
 
 ```bash
 MASTER_KEY=<the cluster master key> \
-  ./ha-join.sh --node-name taranac-node-2 --node-address 10.0.0.2 --join-token <secret>
+  ./ha-join.sh --primary 10.0.0.1 \
+    --node-name taranac-node-2 --node-address 10.0.0.2 --join-token <secret>
 ```
 
 Patroni clones the new node from the primary (its own basebackup + streaming —
 there is no manual `pg_basebackup`), the node comes up as a read-only replica,
 and the script redeems the token so the node registers in the roster. Repeat for
-any further nodes, up to your license's `max_nodes`.
+any further nodes, up to your license's `max_nodes`. (Under `--plaintext` there is
+no cert to copy, and a manual join with no `--primary` needs `--client-tls` — §7.)
 
-### Step 4 — Verify
+### Step 5 — Verify
 
 ```bash
 ./taranac cluster status     # lists nodes + replication health
@@ -221,9 +263,10 @@ or a node falls out of sync — you do not have to poll.
 
 ### Add a node later
 
-Same as a join ([§4 Step 3](#step-3--join-each-additional-node)), within your
+Same as a join ([§4 Step 4](#step-4--join-each-additional-node)), within your
 license's `max_nodes`. Fill the new node's `.env`, issue a token on the current
-primary, run `ha-join.sh` on the new node.
+primary, copy its pre-issued etcd cert out-of-band, and run `ha-join.sh --primary`
+on the new node.
 
 ### Decommission a node — TWO steps
 
@@ -233,7 +276,8 @@ Both steps are required.
 **Step 1 — soft-delete it from the roster** (run from any node):
 
 ```bash
-./taranac cluster decommission --id <node-id>     # node-id from `./taranac cluster status`
+./taranac cluster decommission --id <node-id>       # node-id from `./taranac cluster status`
+./taranac cluster decommission --name <node-name>   # or by name (active nodes only)
 ```
 
 This marks the node `decommissioned` in the roster (its id is retained forever so
@@ -258,6 +302,41 @@ drop a replication slot by hand.**
 > If removing a node would leave you with two DB nodes, you must keep (or add) a
 > witness or you lose safe automatic failover.
 
+#### Removing a node that is DEAD (won't come back)
+
+If the node is permanently gone (hardware loss, etc.) you can't run Step 2 on it,
+and its **etcd voting membership** must be removed or it drags quorum math down
+forever. `ha-deconvert.sh` does all of it in one command — run it **on a surviving
+node**:
+
+```bash
+./ha-deconvert.sh --decommission-dead --node-name node-2 --node-address 10.0.0.2
+```
+
+It soft-deletes the roster row, runs `etcdctl member remove` for the dead member,
+prunes it from **this node's** `DB_HOSTS` / `ETCD_HOSTS` / `ETCD_INITIAL_CLUSTER`,
+and warns if the remaining etcd count becomes even (an even voting count buys no
+extra fault tolerance). The roster + etcd changes are cluster-wide, but the `.env`
+prune is per-node — **re-run the same command on every other surviving node**, then
+restart them so etcd picks up the shrunk membership. If the dead node ever returns,
+wipe its `pg_data` **and** `etcd_data` volumes before re-joining.
+
+### Shrink back to a single node (remove HA)
+
+To go all the way back to a plain standalone install — on the **surviving primary,
+after** the other nodes are decommissioned and torn down:
+
+```bash
+./ha-deconvert.sh          # back up first; add --yes to skip the prompt
+```
+
+It stops the HA overlay, strips the HA markers from `.env`, brings the stack up on
+the base compose so the standalone Postgres image **adopts the data dir in place**
+(the reverse of `ha-convert.sh`), drops the orphan replication slots, and removes
+the orphan etcd volume. It **refuses** to run on a replica or while replicas are
+still streaming (that would strand them) — decommission and tear those down first.
+Afterwards the witness host is no longer needed (`docker-compose.witness.yml down`).
+
 ---
 
 ## 6. Upgrades under HA
@@ -270,7 +349,9 @@ upgrading.
 
 > `./taranac update` is HA-aware: on a converted node it brings the **database** back
 > up under the Patroni overlay automatically (no manual `-f … -f` form needed) and
-> reminds you of the one-node-at-a-time order. Recreating a node's container restarts
+> reminds you of the one-node-at-a-time order. It also **detects whether this node is the
+> primary** and, if so, warns you to update the replicas first and this node last (Ctrl-C
+> if you started on the primary by mistake). Recreating a node's container restarts
 > its Postgres — on the **primary** that triggers a failover, which is exactly why you
 > do the primary **last**. It also refreshes the HA overlay/tooling/runbook files
 > themselves so they stay in step with the new images. (An update that changes the etcd
@@ -281,9 +362,10 @@ upgrading.
 
 ## 7. Security — you MUST do this
 
-The HA control-plane traffic is **not encrypted or authenticated** by default
-(etcd speaks plaintext HTTP). It carries the cluster's control state and database,
-so you must keep it on a private, firewalled interconnect:
+The HA control plane carries the cluster's control state and database. As of **1.0.7 (#30)** it is
+**encrypted by default** — the default convert secures etcd (peer auto-TLS + one-way client TLS). The
+**firewall is still the always-on baseline** (TLS is not a substitute), so you must keep it on a private,
+firewalled interconnect:
 
 - **Firewall the cluster ports to the private interconnect only — never expose
   them publicly:**
@@ -295,6 +377,80 @@ so you must keep it on a private, firewalled interconnect:
 - The only ports that should face users/devices are the same as a single-node
   install: **443** (UI) and the AAA/NAC service ports you use.
 
+**Secure etcd is the DEFAULT — the tooling provisions it (no hand-editing).** The default
+`ha-convert.sh` convert encrypts BOTH etcd channels: the peer channel (`2380`, cross-host Raft) via
+auto-TLS, and the client channel (`2379`, Patroni↔etcd) via a shared CA (one-way — etcd presents a
+CA-signed cert, clients verify it, no client certs; the CA private key **never leaves the seed**).
+Because the witness must be a live etcd member **before** the convert (convert prunes any not-yet-started
+member) but the witness's cert can only be signed by the CA the convert generates, the secure convert is
+**two-phase**:
+
+1. **Prepare** on the seed: `./ha-convert.sh --prepare --node-name … --node-address …` — it generates the
+   CA + this node's cert, enables peer auto-TLS + rewrites the member URLs to `https://`, pre-issues a
+   cert for **every** other member into `config/cluster-secrets/etcd/<member>/`, writes the `https` knobs,
+   and stops (still standalone).
+2. **Bring the witness up** (its host): the witness is **secure by default too (#46)** — it ships
+   `.env.witness.example` with the peer + client TLS lines already set, so you don't hand-edit each knob.
+   `cp .env.witness.example .env` and set `NODE_ADDRESS`/`ETCD_NAME`/`TARANAC_CLUSTER_NAME` + the `https://`
+   `ETCD_INITIAL_CLUSTER` member list; copy `config/cluster-secrets/etcd/<witness>/` into the witness
+   bundle's `config/etcd-tls/` **out-of-band** (the template's TLS paths already point at it), then
+   `docker compose -f docker-compose.witness.yml up -d`.
+3. **Continue** on the seed: `./ha-convert.sh --continue` — it does the real convert now that the witness
+   is live (it verifies quorum with the witness before pruning, and refuses otherwise).
+4. For each other DB node, copy that node's `config/cluster-secrets/etcd/<node>/` into its
+   `config/etcd-tls/` **out-of-band** and run `./ha-join.sh --primary <seed> …` (it auto-follows the
+   cluster's https scheme; a manual join with no `--primary` needs `--client-tls`).
+
+The same `config/cluster-secrets/` set also carries `MASTER_KEY` and the shared `taranac-mfa` key so Push
+works on every node (§12.1) — keep it as safe as `MASTER_KEY`. Full procedure + live-cluster migration:
+`docs/guide/ha.md` §7.2/§7.3. (`--client-tls` is accepted as a no-op alias — TLS is already the default.)
+
+**Opting DOWN to plaintext (`--plaintext`).** If your interconnect is already isolated and you want the
+legacy plaintext-http single-shot convert, run `./ha-convert.sh --plaintext --node-name … --node-address
+…` (witness up first). It forces both etcd channels to http and needs no certs. Flipping the scheme on a
+*running* cluster breaks the etcd ring — migrate only via the maintenance-window procedure in
+`docs/guide/ha.md` §7.2/§7.3, never a blind restart.
+
+---
+
+## 7a. Durable gotchas — the three that bite silently
+
+These three failure modes are subtle (no crash, no obvious error) and were each hardened in the
+tooling. Know them before you convert; the tooling handles the common path, but the footgun is real.
+
+1. **The HA config dirs MUST be operator-writable — Docker will root-create them otherwise.**
+   `config/etcd-tls`, `config/etcd-ca`, and `config/cluster-secrets` are bind-mounted. If a container
+   starts before they exist, Docker creates the path **owned by root**, and you can then no longer write
+   this node's etcd leaf / CA into it — `ha-convert --prepare` fails on a confusing permission error.
+   Fresh **1.0.7+** bundles ship these dirs pre-created and **user-owned** (each carries a `.gitkeep`) and
+   `--prepare` **prechecks** writability and fails loudly up front. Only older installs are exposed; fix
+   with `sudo chown -R "$(id -u):$(id -g)" config/etcd-tls config/etcd-ca config/cluster-secrets`.
+
+2. **A joining node's stale volumes are reconciled by `ha-join` — do not skip it or pre-start the node.**
+   Three data volumes carry per-cluster identity: a stale `taranac_etcd_data` from a previous cluster →
+   etcd **"cluster ID mismatch"** and no quorum; a `taranac_mfa_data` `enckey` this node self-generated
+   (because it was started standalone first) → Push tokens minted on another node **fail to decrypt here**
+   (surfaces as *"Invalid setup link"*); and `master_key` must be the cluster's, not a local one. `ha-join.sh`
+   **clears a stale `taranac_etcd_data`** and **reconciles a mismatched mfa `enckey`** before `up -d`. To
+   avoid ever creating these on a joiner, write its `.env` with **`install.sh --no-start`** (never bring a
+   standalone stack up on a node you intend to join).
+
+3. **The cluster-shared secret set must be identical on every node** — provisioned out-of-band, **never a
+   replicated DB row**. Five secrets are cluster-wide (a wrong/missing one is silent: undecryptable stored
+   secrets, mfa 401s, or invalid login sessions on that node):
+
+   | Secret | What it protects | How it reaches a joiner |
+   |---|---|---|
+   | `MASTER_KEY` | the KEK for every stored secret **and the daemons' KEK** (daemons read it from the `master_key` volume, not env) | **OOB only** (`MASTER_KEY=… ./ha-join.sh …`) — never in the DB or the join-config API |
+   | `SECRET_KEY` | signs the app's JWTs (login, MFA-setup links, invites) | fetched by `ha-join --primary` (join-config API), or hand-copied (#36) |
+   | `mfa.enckey` | `taranac-mfa`'s Push/TOTP token crypto | **OOB** in `config/cluster-secrets/mfa.enckey` (§12.1), reconciled by `ha-join` (#35) |
+   | `TARANAC_MFA_API_KEY` | backend ↔ `taranac-mfa` auth | fetched by `ha-join --primary` (#13) |
+   | `POSTGRES_PASSWORD` / `POSTGRES_REPLICATION_PASSWORD` | app + streaming-replication creds | copied into `.env` per §3 (must match node-1) |
+
+   `ha-convert` (seed) assembles the OOB set into `config/cluster-secrets/`; carry it to each node exactly
+   as you carry `MASTER_KEY`. The join-config API deliberately returns DB creds + `SECRET_KEY` +
+   `TARANAC_MFA_API_KEY` but **never** `MASTER_KEY`, the mfa `enckey`, or the etcd CA key.
+
 ---
 
 ## 8. Troubleshooting
@@ -303,6 +459,8 @@ so you must keep it on a private, firewalled interconnect:
 |---|---|
 | **node-1 never becomes primary** during `ha-convert.sh` | etcd has no quorum. Confirm the **witness** is up (`docker-compose.witness.yml`) and reachable, then check `docker logs taranac-db`. |
 | **A node won't join / `ha-join.sh` times out** | Check that `MASTER_KEY` matches the rest of the cluster, that `POSTGRES_REPLICATION_PASSWORD` (and `POSTGRES_PASSWORD`) match the primary, and that the primary is reachable on the address in `DB_HOSTS`. |
+| **A re-join won't form quorum / etcd "cluster ID mismatch"** | This node has a **stale `taranac_etcd_data`** volume from a previous cluster. `ha-join.sh` now clears it automatically before starting etcd; if you cleared `taranac_pg_data` by hand for a re-join, let the script run (it reconciles etcd data too). To do it manually: `docker volume rm taranac_etcd_data`. |
+| **`ha-convert.sh` (client-TLS) fails writing certs / "cannot write to config/etcd-tls"** | Docker created `config/etcd-tls` **root-owned** on an earlier start, so you can't write this node's etcd leaf into it. Fix ownership and retry: `sudo chown -R "$(id -u):$(id -g)" config/etcd-tls config/etcd-ca config/cluster-secrets`. (Fresh 1.0.7+ bundles ship these dirs pre-created and user-owned, so this only bites older installs.) |
 | **`ha-convert.sh` / `ha-join.sh` refuses with "< 3 etcd members"** | Your `ETCD_INITIAL_CLUSTER` lists fewer than 3 members. A 2-node cluster needs a witness — add the 3rd etcd member and bring up the witness host. |
 | **A `cluster:readiness` / `cluster:readiness_blind` or grant alert** | Only relevant if you run a hardened, non-superuser database. The app role is missing a stats grant — see the design spec `docs/guide/ha.md` §5. The default Taranac DB image is unaffected. |
 | **Worried about split-brain** | With a witness there is none: a partitioned old primary self-demotes to read-only on its own (it cannot reach quorum), so two writers never exist. Just keep the witness in a separate failure domain. |

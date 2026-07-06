@@ -33,28 +33,33 @@ RELEASE_LATEST_API="${TARANAC_RELEASE_API:-https://api.github.com/repos/${GITHUB
 RELEASE_DL_BASE="${TARANAC_RELEASE_DL_BASE:-https://github.com/${GITHUB_REPO}/releases/download}"
 CURL_TIMEOUT="${TARANAC_CURL_TIMEOUT:-6}"
 
-# Framework files the updater is allowed to overwrite. Operator state — .env and
-# config/ (TLS certs, Firebase key) and Docker volumes — is deliberately absent.
-FRAMEWORK_FILES=(
-    taranac
-    taranac-update.sh
-    docker-compose.yml
-    install.sh
-    bootstrap.sh
-    INSTALL.md
-    README.md
-    .env.example
-    VERSION
-    postgres-initdb
-    # HA (Pro) framework — refreshed so an HA operator's overlay/tooling/runbook stay
-    # current with the images (a stale overlay against new images is its own footgun).
-    # Absent from an older bundle's extract → cmd_apply's `[ -e ]` guard skips them.
-    docker-compose.ha.yml
-    docker-compose.witness.yml
-    ha-convert.sh
-    ha-join.sh
-    HA.md
+# The updater refreshes EVERYTHING the fresh bundle carries and protects only the few
+# operator-owned paths below. This is a blocklist, not an allowlist, on purpose: a
+# hand-maintained "framework files" allowlist silently DROPS every newly-shipped file
+# an operator never asked to keep stale (#29 — e.g. ha-etcd-ca.sh, added in a later
+# release, was invisible to the old list). The set of framework files is defined in
+# exactly one place — the bundle's own contents (deploy/build-bundle.sh) — and the
+# updater derives from that, so the two can never drift.
+#
+# Operator-owned — NEVER overwritten or removed by an update (state, not framework):
+#   .env      the real environment (the bundle ships .env.example, never .env).
+#   config/   operator secrets + TLS material: certs, Firebase key, and — under HA —
+#             the etcd CA (config/etcd-ca), this node's leaf (config/etcd-tls) and the
+#             cluster secret set (config/cluster-secrets). The bundle ships an EMPTY
+#             config/ placeholder; blindly copying it would WIPE all of the above.
+# Docker volumes (pg_data, etc.) live outside the bundle dir and are never touched.
+OPERATOR_OWNED=(
+    .env
+    config
 )
+
+# 0 = this bundle entry is operator-owned (skip it); 1 = framework (refresh it).
+is_operator_owned() {  # $1 = basename of a top-level bundle entry
+    local p
+    for p in "${OPERATOR_OWNED[@]}"; do [ "$1" = "${p}" ] && return 0; done
+    case "$1" in .taranac-backup-*) return 0 ;; esac   # our own rollback backups
+    return 1
+}
 
 c_bold=$'\033[1m'; c_green=$'\033[32m'; c_yellow=$'\033[33m'; c_red=$'\033[31m'; c_dim=$'\033[2m'; c_reset=$'\033[0m'
 info()   { printf '%s\n' "${c_bold}==>${c_reset} $*"; }
@@ -98,13 +103,63 @@ ha_compose_files() {
     HA_ACTIVE=1
 }
 
-# Remind the operator of the one-node-at-a-time discipline when restarting an HA node.
+# ── Belt-and-suspenders: re-resolve the reverse-proxy upstreams (#19a) ───────
+# `docker compose up -d` recreates only containers whose own image/config changed.
+# When the api (or frontend) image is bumped, that container gets a NEW docker-network
+# IP — but the edge/frontend nginx in front of it did NOT change, so its worker keeps
+# the upstream's OLD IP and every request 502s until the proxy is recreated (a plain
+# `restart` re-runs the same workers and does NOT help — only a recreate does). The
+# baked nginx now re-resolves upstreams through the Docker DNS resolver (edge +
+# frontend templates), which fixes this in steady state — but an operator upgrading
+# FROM an older, pre-resolver image would still hit the stale-IP 502 on the very first
+# update. Force-recreating the two stateless proxy containers after up -d closes that
+# gap regardless of image vintage; --no-deps keeps it from cascading into api/postgres.
+refresh_proxy_dns() {
+    local env_file="$1"
+    info "Re-resolving reverse-proxy upstreams (edge, frontend) ..."
+    docker compose --env-file "${env_file}" "${COMPOSE_FILES[@]}" \
+        up -d --force-recreate --no-deps edge frontend \
+        || warn "Could not recreate edge/frontend. If you see 502s after this update, run: ./taranac up -d --force-recreate --no-deps edge frontend"
+}
+
+# Is THIS node the cluster primary (Patroni leader)? Best-effort, node-local: ask the
+# local Postgres directly — pg_is_in_recovery()=false ⇒ primary/leader. No etcd/quorum
+# call (matches am_i_leader in the app + the sibling ha scripts). Any error (db down, not
+# up yet, wrong creds) ⇒ "unknown" so we degrade to the generic guidance, never suppress
+# it. Echoes exactly one of: leader | replica | unknown.
+node_role() {
+    local out
+    out="$(docker exec taranac-db psql -U taranac -d taranac -tAc 'select pg_is_in_recovery()' 2>/dev/null | tr -d '[:space:]')" || out=""
+    case "${out}" in
+        f) echo leader ;;
+        t) echo replica ;;
+        *) echo unknown ;;
+    esac
+}
+
+# Remind the operator of the one-node-at-a-time discipline when restarting an HA node,
+# and — leader-aware (#21) — call out when THIS node is the primary so it is updated LAST.
 ha_upgrade_notice() {
     [ "${HA_ACTIVE:-0}" = "1" ] || return 0
     echo
     warn "HA node — the database comes up under the Patroni overlay."
     notice "Upgrade ONE node at a time: replicas FIRST, the primary LAST (recreating the"
     notice "primary's container triggers a failover). Back up first. (HA.md §6 / ha.md §6)"
+    local role; role="$(node_role)"
+    case "${role}" in
+        leader)
+            echo
+            warn "THIS node is the cluster PRIMARY (Patroni leader)."
+            notice "Update every REPLICA node FIRST and this primary LAST. Restarting the primary"
+            notice "here triggers a failover; doing it before the replicas are on the new version"
+            notice "can strand the cluster split across versions. If the replicas are not updated"
+            notice "yet, Ctrl-C now and update them first." ;;
+        replica)
+            notice "This node is a REPLICA — safe to update ahead of the primary." ;;
+        *)
+            notice "(Could not determine whether this node is primary or replica — check"
+            notice " './taranac cluster status' and update the primary last.)" ;;
+    esac
     echo
 }
 
@@ -180,7 +235,6 @@ update_images_only() {
     [ -n "${target}" ] || die "internal: images-only update needs a target version."
     [ -f "${ENV_FILE}" ] || die "no .env at ${ENV_FILE} — run this from the bundle directory."
     sed -i -E "s/^TARANAC_VERSION=.*/TARANAC_VERSION=${target}/" "${ENV_FILE}"
-    grep -q '^APP_VERSION=' "${ENV_FILE}" && sed -i -E "s/^APP_VERSION=.*/APP_VERSION=${target}/" "${ENV_FILE}"
     ok "Pinned TARANAC_VERSION=${target} in .env"
     if [ "${do_restart}" = "1" ]; then
         ha_compose_files "${BUNDLE_DIR}"           # merges the HA overlay under HA (or dies if missing)
@@ -188,6 +242,7 @@ update_images_only() {
         info "Pulling images and restarting (migrations run automatically on api start) ..."
         docker compose --env-file "${ENV_FILE}" "${COMPOSE_FILES[@]}" pull
         docker compose --env-file "${ENV_FILE}" "${COMPOSE_FILES[@]}" up -d
+        refresh_proxy_dns "${ENV_FILE}"
         ok "Images updated → ${target} (framework files left unchanged)."
     else
         notice "Skipped image pull / restart (--no-restart). Apply later with: ./taranac up -d"
@@ -210,31 +265,41 @@ cmd_apply() {
     backup="${dest}/.taranac-backup-${stamp}"
     mkdir -p "${backup}"
 
+    # Enumerate what the FRESH bundle carries (every top-level entry, dotfiles too:
+    # .env.example, .gitignore) and refresh all of it except operator-owned paths.
+    # `[ -e ]` makes the globs nullglob-safe if a pattern matches nothing.
     info "Backing up current bundle files → ${backup}"
-    local f
-    for f in "${FRAMEWORK_FILES[@]}"; do
-        [ -e "${dest}/${f}" ] && cp -a "${dest}/${f}" "${backup}/" || true
+    local entry name
+    for entry in "${src}"/* "${src}"/.[!.]*; do
+        [ -e "${entry}" ] || continue
+        name="$(basename "${entry}")"
+        is_operator_owned "${name}" && continue
+        [ -e "${dest}/${name}" ] && cp -a "${dest}/${name}" "${backup}/" || true
     done
 
     info "Updating bundle files (operator .env and config/ are left untouched)"
-    for f in "${FRAMEWORK_FILES[@]}"; do
-        if [ -e "${src}/${f}" ]; then
-            rm -rf "${dest:?}/${f}"
-            cp -a "${src}/${f}" "${dest}/${f}"
-        fi
+    for entry in "${src}"/* "${src}"/.[!.]*; do
+        [ -e "${entry}" ] || continue
+        name="$(basename "${entry}")"
+        is_operator_owned "${name}" && continue
+        rm -rf "${dest:?}/${name}"
+        cp -a "${entry}" "${dest}/${name}"
     done
-    chmod +x "${dest}/taranac" "${dest}/taranac-update.sh" \
-             "${dest}/install.sh" "${dest}/bootstrap.sh" \
-             "${dest}/ha-convert.sh" "${dest}/ha-join.sh" 2>/dev/null || true
+    # Restore exec bits by glob, not a hand list — a newly-shipped *.sh must never come
+    # up non-executable just because someone forgot to add it here. `taranac` (the
+    # extensionless wrapper) is the one non-.sh entrypoint, so name it explicitly.
+    chmod +x "${dest}/taranac" 2>/dev/null || true
+    chmod +x "${dest}"/*.sh 2>/dev/null || true
     ok "Bundle files updated."
 
     # Surface new .env settings without ever editing the operator's .env silently.
     report_new_env_keys "${src}/.env.example" "${env_file}"
 
-    # Bump the pinned version in .env (and APP_VERSION) so `pull` fetches it.
+    # Bump the pinned image tag in .env so `pull` fetches the new version. This
+    # is the ONE version knob — the app's reported version is baked into the
+    # images (from VERSION at build) and is never carried in .env.
     if [ -n "${target_ver}" ] && [ -f "${env_file}" ]; then
         sed -i -E "s/^TARANAC_VERSION=.*/TARANAC_VERSION=${target_ver}/" "${env_file}"
-        sed -i -E "s/^APP_VERSION=.*/APP_VERSION=${target_ver}/" "${env_file}"
         ok "Pinned TARANAC_VERSION=${target_ver} in .env"
     fi
 
@@ -244,6 +309,7 @@ cmd_apply() {
         info "Pulling images and restarting (migrations run automatically on api start) ..."
         docker compose --env-file "${env_file}" "${COMPOSE_FILES[@]}" pull
         docker compose --env-file "${env_file}" "${COMPOSE_FILES[@]}" up -d
+        refresh_proxy_dns "${env_file}"
         ok "Stack updated."
     else
         notice "Skipped image pull / restart (--no-restart). Apply later with: ./taranac up -d"

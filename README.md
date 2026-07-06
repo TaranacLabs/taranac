@@ -1,5 +1,7 @@
 # Taranac — deployment
 
+![tests](https://img.shields.io/badge/tests-1792%20passing-brightgreen) ![coverage](https://img.shields.io/badge/coverage-70%25-green) &nbsp;·&nbsp; [Testing &amp; quality →](TESTING.md)
+
 Network access control (TACACS+ / RADIUS / 802.1X) with a web UI. This directory
 is everything you need to run Taranac from published Docker images — no source.
 
@@ -20,7 +22,7 @@ Copy-paste on a fresh host — download, unpack, install Docker, start Taranac:
 # 1 — download and unpack the latest release
 curl -fsSL -O https://github.com/TaranacLabs/taranac/releases/latest/download/taranac-bundle.tar.gz
 tar xf taranac-bundle.tar.gz
-cd taranac-*/
+cd taranac
 
 # 2 — install Docker + compose plugin (skips if already present), then log out and
 #     back in so the docker group applies (or run: newgrp docker)

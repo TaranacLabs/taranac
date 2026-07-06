@@ -28,18 +28,25 @@ check() { if eval "$2"; then ok "$1"; else bad "$1 — [$2]"; fi; }
 NEW_VER="1.0.0-rc2"
 OLD_VER="1.0.0-rc1"
 
-FRAMEWORK=(taranac taranac-update.sh docker-compose.yml install.sh bootstrap.sh INSTALL.md README.md .env.example VERSION postgres-initdb docker-compose.ha.yml docker-compose.witness.yml ha-convert.sh ha-join.sh HA.md)
+FRAMEWORK=(taranac taranac-update.sh docker-compose.yml install.sh bootstrap.sh INSTALL.md README.md .env.example VERSION postgres-initdb docker-compose.ha.yml docker-compose.witness.yml ha-convert.sh ha-join.sh ha-etcd-ca.sh HA.md)
 
 # ── 1. Build a realistic "new" bundle tarball from the real dist files ───────
 echo "==> Building bundle tarball (mirrors what release.yml ships)"
-# Stage into a versioned top-level dir, exactly like build-bundle.sh / release.yml
-# ship it, so this run also exercises the updater's top-level-dir normalisation
-# (taranac-update.sh strips the single wrapping folder on extract).
+# Stage into a VERSIONED top-level dir on purpose. build-bundle.sh now ships a
+# version-neutral `taranac/` folder (#40), but OLDER bundles (and any hand-rolled
+# tar) wrap a versioned `taranac-<ver>/` dir — so keep exercising the updater's
+# top-level-dir normalisation against that harder case (taranac-update.sh finds and
+# strips whatever single wrapping folder it gets, versioned or not).
 PREFIX="taranac-${NEW_VER}"
 BUNDLE_SRC="${WORK}/bundle-src/${PREFIX}"
 mkdir -p "${BUNDLE_SRC}"
 for f in "${FRAMEWORK[@]}"; do cp -a "${DIST_DIR}/${f}" "${BUNDLE_SRC}/"; done
 printf '%s\n' "${NEW_VER}" > "${BUNDLE_SRC}/VERSION"
+# The real bundle also ships an (empty-placeholder) config/ dir. The general sync must
+# NOT copy it over the operator's real config/ (TLS certs, keys, the etcd CA). Seed the
+# bundle with sentinel content so the "operator config preserved" assertion is real.
+mkdir -p "${BUNDLE_SRC}/config/tls"
+printf 'BUNDLE-PLACEHOLDER-MUST-NOT-OVERWRITE\n' > "${BUNDLE_SRC}/config/tls/tls.crt"
 TARBALL="taranac-bundle-${NEW_VER}.tar.gz"
 ( cd "${WORK}/bundle-src" && tar -czf "${WORK}/${TARBALL}" "${PREFIX}" )
 ( cd "${WORK}" && sha256sum "${TARBALL}" > SHA256SUMS )
@@ -111,7 +118,10 @@ check "wrapper has new 'update' subcommand"                  "grep -q 'taranac-u
 check ".env.example replaced (has TRUSTED_PROXY_HOPS)"       "grep -q 'TRUSTED_PROXY_HOPS' '${INST}/.env.example'"
 check "VERSION bumped to ${NEW_VER}"                         "[ \"\$(cat '${INST}/VERSION')\" = '${NEW_VER}' ]"
 check ".env TARANAC_VERSION bumped"                          "grep -q '^TARANAC_VERSION=${NEW_VER}\$' '${INST}/.env'"
-check ".env APP_VERSION bumped"                              "grep -q '^APP_VERSION=${NEW_VER}\$' '${INST}/.env'"
+# APP_VERSION is no longer a managed .env key — the version is baked into the
+# images. A stale line in an upgraded operator .env must be left UNTOUCHED
+# (harmless; the baked version wins), never bumped.
+check ".env stale APP_VERSION left untouched (unmanaged)"    "grep -q '^APP_VERSION=${OLD_VER}\$' '${INST}/.env'"
 check ".env MASTER_KEY preserved"                            "grep -qF '${SECRET_MASTER}' '${INST}/.env'"
 check ".env POSTGRES_PASSWORD preserved"                     "grep -q '^POSTGRES_PASSWORD=operator-db-password\$' '${INST}/.env'"
 check ".env TRUSTED_PROXY_HOPS (operator value) preserved"   "grep -q '^TRUSTED_PROXY_HOPS=2\$' '${INST}/.env'"
@@ -119,8 +129,20 @@ check "operator TLS cert untouched"                          "[ \"\$(cat '${INST
 check "HA overlay refreshed into the bundle (framework file)"     "[ -f '${INST}/docker-compose.ha.yml' ]"
 check "HA runbook refreshed into the bundle (framework file)"     "[ -f '${INST}/HA.md' ]"
 check "ha-convert.sh refreshed + executable"                      "[ -x '${INST}/ha-convert.sh' ]"
+# #29: a file shipped in the bundle but absent from any updater allowlist must still be
+# refreshed (the general sync derives from bundle contents). ha-etcd-ca.sh was NOT in
+# the installed bundle and is in no hand list — it must appear, executable, after update.
+check "ha-etcd-ca.sh picked up + executable (general sync, #29)"   "[ -x '${INST}/ha-etcd-ca.sh' ]"
+# The general sync ships a config/ placeholder but must NEVER clobber operator state.
+check "operator config/ preserved (not clobbered by bundle placeholder, #29)" "[ \"\$(cat '${INST}/config/tls/tls.crt')\" = 'OPERATOR-CERT-CONTENT' ]"
 check "backup directory created"                             "ls -d '${INST}'/.taranac-backup-* >/dev/null 2>&1"
 check "backup holds the OLD wrapper"                         "grep -rq 'OLD wrapper' '${INST}'/.taranac-backup-*/taranac"
+# #19a: after every image restart the updater force-recreates the stateless proxy
+# containers so they re-resolve upstream IPs (the E2E runs --no-restart, so assert
+# the wiring statically: helper defined + called in BOTH restart paths).
+check "updater defines refresh_proxy_dns helper"             "grep -q 'refresh_proxy_dns()' '${INST}/taranac-update.sh'"
+check "refresh_proxy_dns force-recreates edge+frontend"      "grep -qE 'force-recreate --no-deps edge frontend' '${INST}/taranac-update.sh'"
+check "refresh_proxy_dns invoked in both restart paths"      "[ \"\$(grep -c 'refresh_proxy_dns \"' '${INST}/taranac-update.sh')\" = 2 ]"
 # The new-key diff lists keys the operator LACKS; keys they already have must be
 # excluded. The bare key is printed indented (^ +KEY$); the explanatory notice
 # uses 'TRUSTED_PROXY_HOPS=2' so it won't match the anchored bare form.

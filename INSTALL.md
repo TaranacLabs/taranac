@@ -31,8 +31,8 @@ downloaded). Grab `taranac-bundle-<ver>.tar.gz` from the
 [Releases page](https://github.com/TaranacLabs/taranac/releases/latest), then:
 
 ```bash
-tar xf taranac-bundle-<ver>.tar.gz   # unpacks into its own folder taranac-<ver>/
-cd taranac-<ver>
+tar xf taranac-bundle-<ver>.tar.gz   # unpacks into its own folder ./taranac/ (version-neutral)
+cd taranac
 ```
 
 **Option B — git clone** (always the latest bundle scripts):

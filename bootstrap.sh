@@ -45,13 +45,17 @@ if command -v systemctl >/dev/null 2>&1; then
 fi
 
 # ── Grant the user Docker socket access ──────────────────────────────
+# Track whether we just added the user this run — if so, THIS shell (and any shell the
+# user already has open) cannot use Docker until they start a new login session. That is
+# the single most-missed step, so we shout about it in a box at the very end.
+NEEDS_RELOGIN=0
 if [ "${TARGET_USER}" != "root" ]; then
     if id -nG "${TARGET_USER}" 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
         ok "User '${TARGET_USER}' already in the docker group."
     else
         usermod -aG docker "${TARGET_USER}"
         ok "Added '${TARGET_USER}' to the docker group."
-        warn "Start a NEW login shell (log out/in, or run: newgrp docker) before ./install.sh."
+        NEEDS_RELOGIN=1
     fi
 fi
 
@@ -59,4 +63,22 @@ fi
 command -v openssl >/dev/null 2>&1 && ok "openssl present." || warn "openssl missing — install it (apt-get install -y openssl) before ./install.sh."
 
 echo
-ok "Prerequisites ready. Next:  cd into the bundle and run ./install.sh"
+ok "Prerequisites ready."
+echo
+
+if [ "${NEEDS_RELOGIN}" -eq 1 ]; then
+    printf '%s\n' "${c_yellow}${c_bold}╔══════════════════════════════════════════════════════════════════╗${c_reset}"
+    printf '%s\n' "${c_yellow}${c_bold}║  ⚠  ONE MORE STEP — YOU ARE NOT DONE YET                          ║${c_reset}"
+    printf '%s\n' "${c_yellow}${c_bold}╠══════════════════════════════════════════════════════════════════╣${c_reset}"
+    printf '%s\n' "${c_yellow}${c_bold}║  You were just added to the 'docker' group, but THIS terminal     ║${c_reset}"
+    printf '%s\n' "${c_yellow}${c_bold}║  cannot use Docker until you start a NEW login session.           ║${c_reset}"
+    printf '%s\n' "${c_yellow}${c_bold}║                                                                  ║${c_reset}"
+    printf '%s\n' "${c_yellow}${c_bold}║  Do ONE of these, THEN run  ./install.sh :                        ║${c_reset}"
+    printf '%s\n' "${c_yellow}${c_bold}║     • log out and log back in, or                                ║${c_reset}"
+    printf '%s\n' "${c_yellow}${c_bold}║     • run:   newgrp docker                                        ║${c_reset}"
+    printf '%s\n' "${c_yellow}${c_bold}║                                                                  ║${c_reset}"
+    printf '%s\n' "${c_yellow}${c_bold}║  If you skip this, ./install.sh will stop and remind you again.   ║${c_reset}"
+    printf '%s\n' "${c_yellow}${c_bold}╚══════════════════════════════════════════════════════════════════╝${c_reset}"
+else
+    ok "Next:  cd into the bundle and run ./install.sh"
+fi

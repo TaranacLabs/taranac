@@ -9,13 +9,26 @@
 # losing that host loses both a DB node AND the tiebreaker at once.
 #
 # Run on the witness HOST only:
+#   cp .env.witness.example .env      # SECURE BY DEFAULT — edit the marked values
 #   docker compose --env-file .env -f docker-compose.witness.yml up -d
 #
-# Its .env needs just the etcd block (ETCD_NAME=witness, the same ETCD_INITIAL_CLUSTER
-# member list as the DB nodes, NODE_ADDRESS=this host's address, TARANAC_CLUSTER_NAME).
+# ⚠️ SECURITY: secure etcd (peer auto-TLS + one-way client TLS) is the DEFAULT (#30/#46),
+# and the witness MUST match the DB nodes IDENTICALLY (an http witness cannot join an https
+# ring). The witness has NO tooling, so its secure default ships in `.env.witness.example`
+# (copy it to `.env`) — the DB nodes get theirs written into `.env` by ha-convert. The
+# `${VAR:-http}`/`${VAR:-false}` FALLBACKS below are NOT the product default: they are the
+# inert plaintext value for a hand-rolled `.env` or a deliberate `ha-convert --plaintext`
+# opt-out (identical rule to docker-compose.ha.yml). The scheme here always tracks `.env`.
 #
-# ⚠️ SECURITY: plaintext http etcd — firewall 2379/2380 to the cluster's private
-# interconnect only (see docker-compose.ha.yml). etcd mutual TLS is a hardening item.
+# Under the secure default, `.env.witness.example` already sets on this witness's `.env`:
+#   • peer:   ETCD_PEER_SCHEME=https + ETCD_PEER_AUTO_TLS=true + https ETCD_INITIAL_CLUSTER
+#   • client: ETCD_CLIENT_SCHEME=https + this witness's own etcd server leaf (SAN = this
+#             host's NODE_ADDRESS) + ca.crt in ./config/etcd-tls (the witness is a full
+#             etcd server). The leaf is issued from the shared CA on the seed (ha-convert
+#             --prepare pre-issues it) and carried OOB (ha.md §7.3).
+# Firewall 2379/2380 to the cluster's private interconnect regardless — TLS is not a
+# substitute for the firewall. To opt DOWN to plaintext, run the seed's convert with
+# --plaintext and follow the plaintext block in `.env.witness.example` (http, no certs).
 # =============================================================================
 name: taranac-witness
 
@@ -26,18 +39,33 @@ services:
     environment:
       ETCD_NAME: ${ETCD_NAME:-witness}
       ETCD_DATA_DIR: /etcd-data
-      ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
-      ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
-      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://${NODE_ADDRESS}:2380
-      ETCD_ADVERTISE_CLIENT_URLS: http://${NODE_ADDRESS}:2379
+      # Peer scheme + auto-TLS — https by the secure default (#30), set in this witness's
+      # .env to MATCH the DB nodes and the ETCD_INITIAL_CLUSTER member URLs (the ${VAR:-…}
+      # fallback is only for a plaintext witness). Encrypts cross-host Raft.
+      ETCD_LISTEN_PEER_URLS: ${ETCD_PEER_SCHEME:-http}://0.0.0.0:2380
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: ${ETCD_PEER_SCHEME:-http}://${NODE_ADDRESS}:2380
+      ETCD_PEER_AUTO_TLS: "${ETCD_PEER_AUTO_TLS:-false}"
+      # Client TLS is a SEPARATE opt-in (default OFF/http), identical to the DB nodes'
+      # etcd (see docker-compose.ha.yml). Empty cert paths ⇒ plaintext http ⇒ unchanged.
+      ETCD_LISTEN_CLIENT_URLS: ${ETCD_CLIENT_SCHEME:-http}://0.0.0.0:2379
+      ETCD_ADVERTISE_CLIENT_URLS: ${ETCD_CLIENT_SCHEME:-http}://${NODE_ADDRESS}:2379
+      ETCD_CERT_FILE: ${ETCD_SERVER_CERT_FILE:-}
+      ETCD_KEY_FILE: ${ETCD_SERVER_KEY_FILE:-}
+      ETCD_CLIENT_CERT_AUTH: "${ETCD_CLIENT_CERT_AUTH:-false}"
       ETCD_INITIAL_CLUSTER: ${ETCD_INITIAL_CLUSTER}
       ETCD_INITIAL_CLUSTER_STATE: ${ETCD_INITIAL_CLUSTER_STATE:-new}
       ETCD_INITIAL_CLUSTER_TOKEN: ${TARANAC_CLUSTER_NAME}
+      # Healthcheck etcdctl needs the CA + https endpoint under client-TLS (§7.3 footgun).
+      ETCDCTL_ENDPOINTS: ${ETCD_CLIENT_SCHEME:-http}://127.0.0.1:2379
+      ETCDCTL_CACERT: ${ETCD_CLIENT_CACERT:-}
     ports:
       - "2379:2379"
       - "2380:2380"
     volumes:
       - etcd_data:/etcd-data
+      # Witness's own client-TLS material (ca.crt + witness etcd-server.crt/.key),
+      # provisioned OOB. Inert when client-TLS is OFF.
+      - ./config/etcd-tls:/etc/etcd/tls:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "etcdctl", "endpoint", "health"]

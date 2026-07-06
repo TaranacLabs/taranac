@@ -6,3 +6,13 @@ config/tls/*
 config/firebase/*
 !config/firebase/.gitkeep
 !config/firebase/README.md
+# HA etcd client-TLS material + the unified cluster secret set (ha.md §7.3/§12) — these
+# hold private keys (etcd CA key, server leaves, mfa key). NEVER commit them. But KEEP the
+# empty dirs (via .gitkeep) so they ship in the bundle USER-owned — else Docker auto-creates
+# config/etcd-tls as ROOT on the first RO mount and the operator can't write leaves (#31).
+config/etcd-tls/*
+!config/etcd-tls/.gitkeep
+config/etcd-ca/*
+!config/etcd-ca/.gitkeep
+config/cluster-secrets/*
+!config/cluster-secrets/.gitkeep
