@@ -1,6 +1,6 @@
 # Taranac — deployment
 
-![tests](https://img.shields.io/badge/tests-1792%20passing-brightgreen) ![coverage](https://img.shields.io/badge/coverage-70%25-green) &nbsp;·&nbsp; [Testing &amp; quality →](TESTING.md)
+![tests](https://img.shields.io/badge/tests-2921%20passing-brightgreen) ![coverage](https://img.shields.io/badge/coverage-77%25-green) &nbsp;·&nbsp; [Testing &amp; quality →](TESTING.md)
 
 Network access control (TACACS+ / RADIUS / 802.1X) with a web UI. This directory
 is everything you need to run Taranac from published Docker images — no source.

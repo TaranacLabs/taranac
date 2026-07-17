@@ -70,9 +70,11 @@ services:
       - /:/host:ro
       - app_logs:/app/logs
       - aaa_logs:/app/logs/aaa
-      - tacacs_logs:/app/logs/tacacs:ro
-      - radius_logs:/app/logs/radius:ro
-      - nac_logs:/app/logs/nac:ro
+      # RW: the API downloads live logs and prunes/deletes forensic month-dirs
+      # (System → Log Rotation). Live-log trimming stays daemon-side.
+      - tacacs_logs:/app/logs/tacacs
+      - radius_logs:/app/logs/radius
+      - nac_logs:/app/logs/nac
       # Daemon config dirs (shared with the daemons): the api generates their
       # configs here and runs the file-based health handshake (.health_signal /
       # .health_result.json). Without these the UI shows the daemons unavailable.
