@@ -1,0 +1,158 @@
+# =============================================================================
+# Taranac — HA (Pro) overlay (docs/guide/ha.md §7.1 / §13).
+#
+# Converts the standalone DB layer to a self-managing Patroni + etcd cluster. Apply
+# it ON TOP of the base compose, on EVERY DB node (each node runs the full stack):
+#
+#   docker compose --env-file .env -f docker-compose.yml -f docker-compose.ha.yml up -d
+#
+# The WITNESS host runs only docker-compose.witness.yml (a 3rd etcd voting member in
+# a SEPARATE failure domain — MANDATORY for a 2-node cluster, ha.md §8).
+#
+# What it changes:
+#   • `postgres` → the taranac-postgres-ha image (Patroni-supervised Postgres 16).
+#     It ADOPTS an existing standalone PGDATA in place (no re-init) or initdb's a
+#     fresh node. Same service NAME so every `@postgres` DSN stays node-local.
+#   • adds a co-located `etcd` member (the DCS).
+#   • publishes 5432/8008 (Postgres + Patroni REST) and 2379/2380 (etcd) so the
+#     OTHER node + the witness can reach this one.
+#
+# The api + daemons need NO change here: they already read DB_HOSTS from .env
+# (writes route to the current primary) and connect to the node-local `@postgres`
+# for reads (§2/§3). Set DB_HOSTS + the HA block in .env.
+#
+# ⚠️ SECURITY: both etcd ports (2379 client + 2380 peer) carry cluster control state, so
+# they MUST be firewalled to the cluster's PRIVATE interconnect and never exposed publicly
+# — TLS is not a substitute for the firewall.
+#
+# Secure etcd (peer auto-TLS + one-way client TLS) is the DEFAULT (#30): ha-convert
+# --prepare/--continue writes ETCD_PEER_SCHEME=https + ETCD_PEER_AUTO_TLS=true and the
+# client-TLS knobs into .env and rewrites the member URLs to https://. The compose
+# ${VAR:-http}/${VAR:-false} FALLBACKS below are NOT the product default — they are the
+# inert value for an un-provisioned / hand-rolled .env or a deliberate `ha-convert
+# --plaintext` opt-out. The scheme here always tracks .env.
+#
+# Peer TLS (ha.md §7.2): auto-TLS = self-signed, zero cert management, encryption-only
+# (NOT mutual auth). etcd requires the peer transport CONSISTENT across the whole ring, so
+# a blind full `up -d` that flips the peer scheme under a LIVE cluster breaks the Raft ring
+# — migrate a running cluster only via the §7.2 runbook, never by editing + `up -d`.
+#
+# CLIENT TLS (ha.md §7.3): the client channel (2379, Patroni↔etcd + every etcdctl) needs a
+# shared, out-of-band-provisioned CA (Patroni's etcd client cannot skip-verify) — ha-convert
+# /ha-join generate + distribute it as part of the unified "cluster secret set" (ha.md §12)
+# into ./config/etcd-tls, RO-mounted below. It is ONE-WAY (server-only): etcd presents a
+# CA-signed cert (SAN = this node's NODE_ADDRESS + 127.0.0.1); clients verify it and present
+# NO client cert (ETCD_CLIENT_CERT_AUTH=false). Empty cert paths ⇒ etcd serves plaintext http
+# ⇒ byte-identical to the plaintext opt-out. Migrating a LIVE cluster http→https client is a
+# deliberate rolling procedure — see the runbook in ha.md §7.3, never a blind `up -d`.
+# =============================================================================
+services:
+  # ── etcd — the DCS (one voting member per DB node; the witness adds the 3rd) ──
+  etcd:
+    container_name: taranac-etcd
+    image: quay.io/coreos/etcd:v3.5.17
+    # etcd reads ETCD_* env natively. ETCD_NAME + the full ETCD_INITIAL_CLUSTER
+    # member list come from .env (identical list on every member; each node sets
+    # its own ETCD_NAME). A 2-node cluster MUST list the 3rd witness member.
+    environment:
+      ETCD_NAME: ${ETCD_NAME}
+      ETCD_DATA_DIR: /etcd-data
+      # Peer (Raft) scheme + auto-TLS — https by the secure default (#30), written into
+      # .env by ha-convert (the ${VAR:-…} fallback here is only for a plaintext/hand-rolled
+      # .env). Encrypts the cross-host interconnect (self-signed, no CA). The scheme here
+      # MUST match the scheme in ETCD_INITIAL_CLUSTER's member URLs.
+      ETCD_LISTEN_PEER_URLS: ${ETCD_PEER_SCHEME:-http}://0.0.0.0:2380
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: ${ETCD_PEER_SCHEME:-http}://${NODE_ADDRESS}:2380
+      ETCD_PEER_AUTO_TLS: "${ETCD_PEER_AUTO_TLS:-false}"
+      # Client (Patroni↔etcd) scheme — https by the secure default (#30); the tooling writes
+      # ETCD_CLIENT_SCHEME=https + the cert paths below (into the ./config/etcd-tls RO mount).
+      # Empty cert paths / the ${VAR:-http} fallback ⇒ etcd serves plaintext http ⇒
+      # byte-identical to the --plaintext opt-out. One-way: no trusted-ca, cert-auth off.
+      ETCD_LISTEN_CLIENT_URLS: ${ETCD_CLIENT_SCHEME:-http}://0.0.0.0:2379
+      ETCD_ADVERTISE_CLIENT_URLS: ${ETCD_CLIENT_SCHEME:-http}://${NODE_ADDRESS}:2379
+      ETCD_CERT_FILE: ${ETCD_SERVER_CERT_FILE:-}
+      ETCD_KEY_FILE: ${ETCD_SERVER_KEY_FILE:-}
+      ETCD_CLIENT_CERT_AUTH: "${ETCD_CLIENT_CERT_AUTH:-false}"
+      ETCD_INITIAL_CLUSTER: ${ETCD_INITIAL_CLUSTER}
+      ETCD_INITIAL_CLUSTER_STATE: ${ETCD_INITIAL_CLUSTER_STATE:-new}
+      ETCD_INITIAL_CLUSTER_TOKEN: ${TARANAC_CLUSTER_NAME}
+      # The healthcheck's etcdctl is itself a client — under client-TLS it MUST get the
+      # https endpoint + CA or the probe fails and `postgres` (depends_on: service_healthy)
+      # never starts, wedging the node with no obvious cause (ha.md §7.3 footgun). Empty
+      # CACERT + http endpoint ⇒ identical to the plaintext default.
+      ETCDCTL_ENDPOINTS: ${ETCD_CLIENT_SCHEME:-http}://127.0.0.1:2379
+      ETCDCTL_CACERT: ${ETCD_CLIENT_CACERT:-}
+    ports:
+      - "2379:2379"
+      - "2380:2380"
+    volumes:
+      - etcd_data:/etcd-data
+      # Client-TLS material (ca.crt + this node's etcd-server.crt/.key), laid down OOB
+      # by ha-convert/ha-join. Empty/inert when client-TLS is OFF.
+      - ./config/etcd-tls:/etc/etcd/tls:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ── postgres → Patroni-supervised Postgres 16 (same service name) ──────────
+  postgres:
+    image: ${IMAGE_PREFIX}/postgres-ha:${TARANAC_VERSION}
+    # Drop the standalone `postgres -c …` command — Patroni owns the conf (it carries
+    # the identical §6.7 baseline in its bootstrap config). The image's entrypoint
+    # renders the Patroni config from the env below and execs Patroni.
+    command: []
+    environment:
+      # Per-node identity + DCS wiring (envsubst'd into the Patroni config).
+      PATRONI_NAME: ${TARANAC_NODE_NAME}
+      PATRONI_SCOPE: ${TARANAC_CLUSTER_NAME}
+      NODE_ADDRESS: ${NODE_ADDRESS}
+      ETCD_HOSTS: ${ETCD_HOSTS}
+      # etcd CLIENT-TLS (one-way): default http ⇒ Patroni's etcd3 block stays scheme-less
+      # ⇒ byte-identical. When enabled, the entrypoint injects `protocol: https` + `cacert`
+      # (the CA in the ./config/etcd-tls RO mount below) so Patroni verifies the etcd cert.
+      ETCD_CLIENT_SCHEME: ${ETCD_CLIENT_SCHEME:-http}
+      ETCD_CLIENT_CACERT: ${ETCD_CLIENT_CACERT:-}
+      # The app role IS the Postgres superuser (matches the standalone image) — one
+      # password, the same the app connects with. This is what lets Patroni adopt an
+      # existing standalone PGDATA in place (that role is its only superuser).
+      PGPW: ${POSTGRES_PASSWORD}
+      # The replicator role password (== the standalone POSTGRES_REPLICATION_PASSWORD).
+      REPLPW: ${POSTGRES_REPLICATION_PASSWORD}
+      # pg_hba TCP scope — NARROW to the cluster's private subnet (default: broad).
+      PG_ALLOW_CIDR: ${PG_ALLOW_CIDR:-0.0.0.0/0}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"   # the other node + its daemons reach this DB
+      - "8008:8008"                      # Patroni REST (patronictl / the slot reaper)
+    volumes:
+      # etcd client-TLS CA (read by Patroni + the entrypoint DCS probe when https).
+      # Inert when client-TLS is OFF. Same source dir as the etcd member above.
+      - ./config/etcd-tls:/etc/etcd/tls:ro
+    depends_on:
+      etcd:
+        condition: service_healthy
+    # Patroni manages Postgres; pg_isready confirms it is accepting connections.
+    # Generous start_period covers initdb/adoption + bootstrap on a fresh node.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U taranac"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 90s
+
+  # ── taranac-mfa — HA write-routing (ha.md §3 / §12) ────────────────────────
+  # The base compose points mfa at the node-local `@postgres`. Its DB
+  # (taranac_mfa) replicates with the cluster, so verify (read) works on any node,
+  # but enroll (write) on a replica hits a read-only DB and fails. Hand mfa the
+  # SAME cluster-wide DB_HOSTS the api uses: psycopg2/libpq then routes writes to
+  # the current primary via target_session_attrs=read-write, and boot migrations
+  # become leader-gated. Empty DB_HOSTS (standalone / DMZ) ⇒ no routing, byte-
+  # identical to the base compose. ha-convert/ha-join set DB_HOSTS in .env.
+  taranac-mfa:
+    environment:
+      TARANAC_MFA_DB_HOSTS: ${DB_HOSTS}
+
+volumes:
+  etcd_data: {}
