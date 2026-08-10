@@ -1,0 +1,297 @@
+#!/usr/bin/env bash
+# Thin wrapper for day-to-day operations, so you don't retype the full compose
+# invocation. From the bundle directory:
+#
+#   ./taranac ps                 # status
+#   ./taranac logs -f api        # follow a service's logs
+#   ./taranac restart edge       # apply a new TLS cert
+#   ./taranac up -d taranac-mfa  # apply a new Firebase key
+#   ./taranac down               # stop everything
+#
+#   ./taranac unlock             # list locked web-admin accounts
+#   ./taranac unlock admin       # unlock a locked account (e.g. after a brute-force)
+#   ./taranac unlock --all       # unlock every locked account
+#
+#   ./taranac reset-password admin   # reset a forgotten web-admin password
+#   ./taranac create-admin           # recover/guarantee an admin login (create-or-repair)
+#
+#   ./taranac installation-id        # print the installation_id (to obtain a Pro license)
+#
+#   ./taranac cluster status                              # HA: nodes + replication health
+#   ./taranac cluster join-token --name node-2 --address 10.0.0.2   # HA: issue a join token
+#
+#   ./taranac restore <archive.tar>  # disaster recovery from a backup archive
+#
+#   ./taranac rotate-key --confirm LOCAL-ACCESS-VERIFIED   # rotate the master key (KEK)
+#        Stops the stack (TACACS+ included — read what it prints before confirming),
+#        re-encrypts every stored secret in one transaction, keeps the previous key
+#        in config/retired-keys/ so older backup archives stay restorable.
+#
+#   ./taranac reset                  # show what a factory reset would do (no changes)
+#   ./taranac reset --confirm RESET  # factory-reset the system (demo/dev only; auto-backup first)
+#
+#   ./taranac version            # show installed version + check for a newer one
+#   ./taranac update             # update images AND bundle files to the latest
+#
+# Equivalent (for compose passthrough): docker compose --env-file .env -f docker-compose.yml <args>
+set -euo pipefail
+HERE="$(dirname "$(readlink -f "$0")")"
+cd "${HERE}"
+
+# NOTE: invoke docker directly with `exec docker compose …`. `exec` replaces the
+# shell with an external program and cannot run a shell function, so a `compose()`
+# helper would fail here with "exec: compose: not found". (Computing the compose-file
+# list in a function and THEN `exec docker compose "${COMPOSE_FILES[@]}"` is fine —
+# the function runs to completion before exec replaces the shell.)
+
+# ── HA overlay awareness (split-brain guard) ────────────────────────────────
+# Under HA the database is Patroni-managed via docker-compose.ha.yml, applied ON TOP
+# of the base compose. Acting on the BASE compose alone would start a second, plain
+# `postgres` on the Patroni-managed data directory — on the primary that is a 2nd
+# writable standalone → split-brain / data loss. So when HA is configured we ALWAYS
+# merge the overlay. If HA is configured but the overlay file is gone, refuse any
+# container-STARTING command (the dangerous ones) rather than silently run base-only;
+# for read-only/diagnostic commands warn but proceed so recovery is never blocked.
+#
+# HA detection (ha.md §13 A) deliberately fails TOWARD the overlay — every miss must
+# be a loud broken start, never a silent split-brain. The authoritative signal is the
+# explicit `TARANAC_HA=1` marker that ha-convert.sh / ha-join.sh write on conversion
+# (unforgeable, no value to mis-parse). As a defense-in-depth fallback we also treat
+# ANY uncommented, non-empty DB_HOSTS as HA — robust to `export `, spaces around `=`,
+# and quotes; we never parse the value or trust the "last" line.
+ha_is_configured() {  # $1 = path to .env; 0 = HA, 1 = standalone
+  local env="$1"
+  [ -f "${env}" ] || return 1
+  if grep -Eq '^[[:space:]]*(export[[:space:]]+)?TARANAC_HA[[:space:]]*=[[:space:]]*"?1"?[[:space:]]*$' "${env}"; then
+    return 0
+  fi
+  if grep -Eiq '^[[:space:]]*(export[[:space:]]+)?DB_HOSTS[[:space:]]*=[[:space:]]*"?[^"[:space:]#]' "${env}"; then
+    return 0
+  fi
+  return 1
+}
+
+ha_compose_files() {  # $1 = the passthrough subcommand; sets the COMPOSE_FILES array
+  COMPOSE_FILES=(-f docker-compose.yml)
+  ha_is_configured .env || return 0         # standalone → base compose only
+  if [ -f docker-compose.ha.yml ]; then
+    COMPOSE_FILES=(-f docker-compose.yml -f docker-compose.ha.yml)
+    return 0
+  fi
+  case "${1:-}" in
+    up|start|restart|run|create)
+      echo "✗ HA is configured (DB_HOSTS is set in .env) but docker-compose.ha.yml is missing." >&2
+      echo "  Refusing '${1}' on the base compose alone: under HA that starts a second writable" >&2
+      echo "  Postgres on the Patroni-managed data directory → split-brain / data loss." >&2
+      echo "  Restore the overlay from the bundle ('./taranac update'), then retry." >&2
+      exit 1 ;;
+    *)
+      echo "! HA is configured but docker-compose.ha.yml is missing — acting on the base compose" >&2
+      echo "  only. Restore it with './taranac update'." >&2 ;;
+  esac
+}
+
+case "${1:-}" in
+  # Convenience subcommands handled by the wrapper, not passed to compose:
+  unlock)
+    # Run the account-unlock tool inside the api container so a locked-out
+    # admin can recover without the web UI.
+    [ -f .env ] || { echo "No .env found — run ./install.sh first." >&2; exit 1; }
+    shift
+    exec docker compose --env-file .env -f docker-compose.yml exec -T api \
+      python -m app.scripts.unlock_user "$@"
+    ;;
+  reset-password)
+    # Reset a web-admin password from the console (forgotten admin password).
+    [ -f .env ] || { echo "No .env found — run ./install.sh first." >&2; exit 1; }
+    shift
+    exec docker compose --env-file .env -f docker-compose.yml exec -T api \
+      python -m app.scripts.reset_password "$@"
+    ;;
+  create-admin)
+    # Recover/guarantee an admin login (create-or-repair) when none works.
+    [ -f .env ] || { echo "No .env found — run ./install.sh first." >&2; exit 1; }
+    shift
+    exec docker compose --env-file .env -f docker-compose.yml exec -T api \
+      python -m app.scripts.create_admin "$@"
+    ;;
+  installation-id)
+    # Print this install's immutable installation_id — the value to bind a Pro
+    # license to (send it to TaranacLabs to have a .lic issued).
+    [ -f .env ] || { echo "No .env found — run ./install.sh first." >&2; exit 1; }
+    shift
+    exec docker compose --env-file .env -f docker-compose.yml exec -T api \
+      python -m app.scripts.show_installation_id "$@"
+    ;;
+  reset)
+    # Factory-reset the system (demo stands). Wipes all data and restores the
+    # fresh-install state. Guarded by APP_ENV (demo/dev only) + an explicit
+    # --confirm RESET, and takes a backup before wiping. No args = dry-run plan.
+    [ -f .env ] || { echo "No .env found — run ./install.sh first." >&2; exit 1; }
+    shift
+    exec docker compose --env-file .env -f docker-compose.yml exec -T api \
+      python -m app.scripts.system_reset "$@"
+    ;;
+  cluster)
+    # HA cluster operations (Pro). Two families, dispatched below:
+    #
+    #   BUILDING the cluster — host-side, because they rewrite this host's .env and
+    #   recreate containers, which the api container cannot do (no compose file in
+    #   this product mounts the docker socket) and must not do (the etcd CA private
+    #   key stays on the host, out of any network-facing container):
+    #     ./taranac cluster init                                  # on the future primary
+    #     ./taranac cluster add-witness --address 10.0.0.3        # the arbiter — REQUIRED
+    #     ./taranac cluster add-node    --address 10.0.0.2        # a replica
+    #     ./taranac cluster remove-node --node taranac-node-2     # evict one
+    #     ./taranac cluster detach                                # THIS node -> standalone
+    #
+    #   OPERATING it — inside the api container, where the DB session, RBAC and the
+    #   audit log are:
+    #     ./taranac cluster status
+    #     ./taranac cluster switchover --to taranac-node-2        # planned handover
+    #     ./taranac cluster join-token --name node-2 --address 10.0.0.2
+    #     ./taranac cluster register | revoke | decommission
+    #
+    # Order matters and is not our invention: ha-convert's second phase requires the
+    # witness to already be a live etcd member, and ha-join refuses a cluster with
+    # fewer than three declared etcd members. init -> add-witness -> add-node.
+    [ -f .env ] || { echo "No .env found — run ./install.sh first." >&2; exit 1; }
+    # ── This host might be the WITNESS ──────────────────────────────────────
+    # A witness runs etcd and nothing else: no database, no api, no roster row. It
+    # unpacks the SAME bundle (that is how it gets witness-join.sh), so every file
+    # here exists and every `cluster` subcommand LOOKS available — but each one needs
+    # either the api container or this node's database, and it has neither. Without
+    # this guard the command falls through to `docker compose exec api …`, which
+    # prints two dozen "variable is not set" warnings for a stack that was never
+    # meant to run here and ends with `service "api" is not running` — an answer that
+    # describes the symptom and hides the reason. Observed on the stand.
+    if docker inspect taranac-witness-etcd >/dev/null 2>&1 && ! docker inspect taranac-db >/dev/null 2>&1; then
+      cat >&2 <<'WITNESSMSG'
+✗ This host is the cluster's WITNESS — it runs etcd only.
+
+  There is no database and no Taranac API here, so none of the 'cluster' commands
+  apply: they all read the cluster's own records or drive its containers, and a
+  witness holds neither. That is by design, not a missing piece — an arbiter you
+  can afford to lose is the whole reason it exists.
+
+  Run them on a DATABASE node instead (the one you ran 'cluster init' on):
+      ./taranac cluster status
+
+  What you CAN do here:
+      docker compose --env-file .env -f docker-compose.witness.yml ps
+      docker compose --env-file .env -f docker-compose.witness.yml logs -f etcd
+      docker exec taranac-witness-etcd etcdctl endpoint health
+      ./witness-join.sh --broker … --token … --pin …    # re-point at a cluster
+WITNESSMSG
+      exit 1
+    fi
+    shift
+    # ── One list, both families ────────────────────────────────────────────
+    # Without this, `./taranac cluster` (or a typo) falls through to the api
+    # container, whose argparse lists ONLY the subcommands it implements — so the
+    # host-side ones (init, add-witness, add-node, remove-node, detach) are missing
+    # from the very list an operator reads to find them. Observed live: an operator
+    # looking for "remove a node" tried `cluster revoke <address>` three times,
+    # because `revoke` was in the list and `remove-node` was not.
+    case "${1:-}" in
+      ""|-h|--help|help)
+        cat <<'CLUSTERHELP'
+Taranac HA cluster (Pro).
+
+  Building the cluster — run these on the PRIMARY's host:
+    init                          declare the cluster and prepare the conversion
+    add-witness --address ADDR     add the etcd arbiter (REQUIRED before nodes)
+    add-node    --address ADDR     add a Taranac node
+      --reinstall                  …that is already a member: evict and re-add it
+    sync                          pull the primary's topology onto THIS node
+                                  (run it on a peer the preflight reported stale)
+    remove-node --node NAME        evict a node from the cluster
+    detach                         turn THIS node back into a standalone install
+
+  Operating it:
+    status                        nodes, roles, replication lag
+    connectivity                  prove every node can log in to every other
+    switchover [--to NAME]        hand leadership over (planned)
+               [--force]          force it when the leader is gone (may lose writes)
+    join-token --name N --address A   issue a join token by hand
+    revoke --id ID                revoke a pending join TOKEN (not a node)
+    register --token SECRET       redeem a join token by hand
+    decommission --name NAME      soft-delete a roster row
+    manifest-publish              store this node's config/cluster.yml in the cluster
+                                  (reads it on stdin; every node can then read it)
+    manifest-fetch                print the cluster's copy (exit 5 if none published)
+    manifest-info                 when it was published, how big, its digest
+
+  Order matters and is enforced by the mechanism, not by us:
+    ./taranac cluster init
+    ./taranac cluster add-witness --address <witness>
+    ./taranac cluster add-node    --address <node>        (once per node)
+
+  Any command above accepts --help for its own options.
+CLUSTERHELP
+        exit 0 ;;
+    esac
+    case "${1:-}" in
+      init|add-witness|add-node|sync)
+        # cluster-wizard.sh calls `./taranac cluster join-token` itself; join-token is
+        # NOT in this dispatch list, so that call falls through to the api container
+        # and cannot recurse back into the wizard.
+        [ -f "${HERE}/cluster-wizard.sh" ] || {
+          echo "cluster-wizard.sh is missing — refresh the bundle once ('./taranac update'), then retry." >&2
+          exit 1
+        }
+        exec bash "${HERE}/cluster-wizard.sh" "$@" ;;
+      remove-node|detach)
+        [ -f "${HERE}/cluster-remove.sh" ] || {
+          echo "cluster-remove.sh is missing — refresh the bundle once ('./taranac update'), then retry." >&2
+          exit 1
+        }
+        sub="$1"; shift
+        case "$sub" in
+          remove-node) exec bash "${HERE}/cluster-remove.sh" "$@" ;;
+          detach)      exec bash "${HERE}/cluster-remove.sh" --detach "$@" ;;
+        esac ;;
+    esac
+    exec docker compose --env-file .env -f docker-compose.yml exec -T api \
+      python -m app.scripts.cluster "$@"
+    ;;
+  restore)
+    # Disaster recovery from a backup archive. Delegates to taranac-restore.sh the
+    # same way version|update delegates to taranac-update.sh — recovery has to edit
+    # host files (.env, ./config) and recreate containers, which a thin
+    # `exec ... exec api` could not do.
+    [ -f "${HERE}/taranac-restore.sh" ] || {
+      echo "taranac-restore.sh is missing — refresh the bundle once, then retry." >&2
+      echo "Download the latest bundle from the project releases and copy it here." >&2
+      exit 1
+    }
+    shift
+    exec bash "${HERE}/taranac-restore.sh" "$@"
+    ;;
+  rotate-key)
+    # Rotate the master encryption key (KEK). Unlike the subcommands above this
+    # is NOT a passthrough into the running api: the stack has to be stopped and
+    # host files (.env, the daemons' master_key volume) have to be rewritten, so
+    # the logic lives in rotate-key.sh — same shape as version|update below.
+    [ -f "${HERE}/rotate-key.sh" ] || {
+      echo "rotate-key.sh is missing — refresh the bundle once ('./taranac update'), then retry." >&2
+      exit 1
+    }
+    shift
+    exec bash "${HERE}/rotate-key.sh" "$@"
+    ;;
+  version|update)
+    # Self-update: refreshes BOTH images and the bundle files (this wrapper,
+    # compose, install.sh, docs). Logic lives in taranac-update.sh.
+    [ -f "${HERE}/taranac-update.sh" ] || {
+      echo "taranac-update.sh is missing — refresh the bundle once, then retry." >&2
+      echo "Download the latest bundle from the project releases and copy it here." >&2
+      exit 1
+    }
+    exec bash "${HERE}/taranac-update.sh" "$@"
+    ;;
+esac
+
+[ -f .env ] || { echo "No .env found — run ./install.sh first." >&2; exit 1; }
+ha_compose_files "${1:-}"
+exec docker compose --env-file .env "${COMPOSE_FILES[@]}" "$@"
