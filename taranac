@@ -1,0 +1,881 @@
+#!/usr/bin/env bash
+# Thin wrapper for day-to-day operations, so you don't retype the full compose
+# invocation. From the bundle directory:
+#
+#   ./taranac ps                 # status
+#   ./taranac logs -f api        # follow a service's logs
+#   ./taranac restart edge       # apply a new TLS cert
+#   ./taranac up -d taranac-mfa  # apply a new Firebase key
+#   ./taranac down               # stop everything
+#
+# The wrapper resolves what kind of host it is on. On an HA WITNESS or a standalone
+# NCM COLLECTOR it drives THAT stack (`./taranac ps` there shows the arbiter's etcd,
+# not a product that does not live on it) and it refuses, with the reason, the
+# commands only a Taranac node can answer.
+#
+#   ./taranac unlock             # list locked web-admin accounts
+#   ./taranac unlock admin       # unlock a locked account (e.g. after a brute-force)
+#   ./taranac unlock --all       # unlock every locked account
+#
+#   ./taranac reset-password admin   # reset a forgotten web-admin password
+#   ./taranac create-admin           # recover/guarantee an admin login (create-or-repair)
+#
+#   ./taranac installation-id        # print the installation_id (to obtain a Pro license)
+#
+#   ./taranac cluster status                              # HA: nodes + replication health
+#   ./taranac cluster join-token --name node-2 --address 10.0.0.2   # HA: issue a join token
+#
+#   ./taranac diagnose --protocol tacacs --device 10.0.0.5
+#        Collect one device's traffic + daemon log + config + our own records
+#        into a single archive for support. Start it, reproduce the problem,
+#        press Enter. Checks first whether the device is configured at all and
+#        which ports the daemons really listen on. No shared secret is ever
+#        written to the archive — only a key fingerprint.
+#
+#   ./taranac diagnose --protocol ncm --config "core-sw-01 running-config"
+#        Why a configuration collection fails, for ONE tracked config, in one
+#        readable file. Runs a single real collection through the same engine a
+#        schedule uses and stores nothing. Reports what it resolved BEFORE any
+#        network (driver, transport, credentials) — that is where this class of
+#        failure happens — then reachability, the SSH handshake, and the session
+#        itself. Add --full-transcript and the report CONTAINS THE DEVICE CONFIG.
+#
+#   ./taranac diagnose --protocol snmp --device SW1
+#        Why an SNMP poll comes back empty or not at all, for ONE device. Runs a
+#        single real poll through the same collectors the hourly sweep uses and
+#        stores nothing. Reports what it resolved BEFORE any packet (the switch,
+#        the profile and which step of the inheritance chain it came from, the
+#        address and why that one), then what this image can encrypt, the v3
+#        engine-id exchange on its own, every request it made, and finally what
+#        the device did and did not tell us — including which forwarding MIB
+#        answered and, when the table carries no VLANs, one VLAN-indexed probe.
+#
+#   ./taranac diagnose --ha           # HA: a snapshot of this node's cluster view
+#        Run it on EVERY node, the witness included, and send all the archives.
+#        Most HA faults are disagreements between nodes, and a disagreement
+#        cannot be seen from one side of it. Safe on a node that will not start.
+#
+#   ./taranac restore <archive.tar>  # disaster recovery from a backup archive
+#
+#   ./taranac rotate-key --confirm LOCAL-ACCESS-VERIFIED   # rotate the master key (KEK)
+#        Stops the stack (TACACS+ included — read what it prints before confirming),
+#        re-encrypts every stored secret in one transaction, keeps the previous key
+#        in config/retired-keys/ so older backup archives stay restorable.
+#
+#   ./taranac reset                  # show what a factory reset would do (no changes)
+#   ./taranac reset --confirm RESET  # factory-reset the system (demo/dev only; auto-backup first)
+#
+#   ./taranac version            # show installed version + check for a newer one
+#   ./taranac update             # update images AND bundle files to the latest
+#
+# Equivalent (for compose passthrough): docker compose --env-file .env -f docker-compose.yml <args>
+set -euo pipefail
+HERE="$(dirname "$(readlink -f "$0")")"
+# Where the operator stood, for the delegated scripts that take a host path
+# (`restore <archive>`): after the cd below a relative path would silently mean
+# "relative to the bundle".
+export TARANAC_CALLER_PWD="${PWD}"
+cd "${HERE}"
+
+# NOTE: invoke docker directly with `exec docker compose …`. `exec` replaces the
+# shell with an external program and cannot run a shell function, so a `compose()`
+# helper would fail here with "exec: compose: not found". (Computing the compose-file
+# list in a function and THEN `exec docker compose "${COMPOSE_FILES[@]}"` is fine —
+# the function runs to completion before exec replaces the shell.)
+
+# ── HA overlay awareness (split-brain guard) ────────────────────────────────
+# Under HA the database is Patroni-managed via docker-compose.ha.yml, applied ON TOP
+# of the base compose. Acting on the BASE compose alone would start a second, plain
+# `postgres` on the Patroni-managed data directory — on the primary that is a 2nd
+# writable standalone → split-brain / data loss. So when HA is configured we ALWAYS
+# merge the overlay. If HA is configured but the overlay file is gone, refuse any
+# container-STARTING command (the dangerous ones) rather than silently run base-only;
+# for read-only/diagnostic commands warn but proceed so recovery is never blocked.
+#
+# HA detection (ha.md §13 A) deliberately fails TOWARD the overlay — every miss must
+# be a loud broken start, never a silent split-brain. The authoritative signal is the
+# explicit `TARANAC_HA=1` marker that ha-convert.sh / ha-join.sh write on conversion
+# (unforgeable, no value to mis-parse). As a defense-in-depth fallback we also treat
+# ANY uncommented, non-empty DB_HOSTS as HA — robust to `export `, spaces around `=`,
+# and quotes; we never parse the value or trust the "last" line.
+ha_is_configured() {  # $1 = path to .env; 0 = HA, 1 = standalone
+  local env="$1"
+  [ -f "${env}" ] || return 1
+  if grep -Eq '^[[:space:]]*(export[[:space:]]+)?TARANAC_HA[[:space:]]*=[[:space:]]*"?1"?[[:space:]]*$' "${env}"; then
+    return 0
+  fi
+  if grep -Eiq '^[[:space:]]*(export[[:space:]]+)?DB_HOSTS[[:space:]]*=[[:space:]]*"?[^"[:space:]#]' "${env}"; then
+    return 0
+  fi
+  return 1
+}
+
+# ── Which kind of host is this? (one bundle installs three) ──────────────────
+# The same bundle is unpacked on a full product node, on an HA WITNESS (etcd arbiter,
+# via witness-join.sh) and on a standalone NCM COLLECTOR (collector-join.sh) — that is
+# how those hosts get their own scripts, and it puts this wrapper on all three. Its
+# every command used to assume the product: `./taranac ps` looked at a stack that does
+# not exist here, and `./taranac up -d` would have STARTED it — the whole product on an
+# arbiter whose only purpose is to be cheap to lose. So the wrapper now resolves the
+# host's role first and drives the compose file that actually belongs to it.
+#
+# Positive signals only, failing TOWARD the product: an unclassifiable host behaves
+# exactly as it did before. Mirrors install_is_* in taranac-update.sh (kept
+# self-contained on purpose — either file must work alone).
+env_has_value() {  # $1 = env file, $2 = ERE alternation of key names
+  [ -f "$1" ] || return 1
+  grep -Eq "^[[:space:]]*(export[[:space:]]+)?($2)[[:space:]]*=[[:space:]]*\"?[^\"[:space:]#]" "$1"
+}
+
+# A product .env always has at least one of these; a witness .env has none of them by
+# construction (witness-join.sh stores no cluster credentials at all).
+is_product_host() { env_has_value .env 'SECRET_KEY|MASTER_KEY|MASTER_KEY_FILE|POSTGRES_PASSWORD|IMAGE_PREFIX'; }
+
+is_witness_host() {
+  if is_product_host; then return 1; fi
+  if grep -Eq '^[[:space:]]*(export[[:space:]]+)?TARANAC_ROLE[[:space:]]*=[[:space:]]*"?witness"?[[:space:]]*$' .env 2>/dev/null; then return 0; fi
+  if env_has_value .env 'ETCD_NAME' && env_has_value .env 'ETCD_INITIAL_CLUSTER'; then return 0; fi
+  # Last resort for an unreadable or hand-rolled .env: ask the daemon. A witness runs
+  # the arbiter's etcd and NO database — the pair is what makes the answer safe.
+  if docker inspect taranac-witness-etcd >/dev/null 2>&1 && ! docker inspect taranac-db >/dev/null 2>&1; then return 0; fi
+  return 1
+}
+
+# The collector keeps its own env + compose files, so it can share a host with a
+# witness. "Collector host" here means collector AND NOTHING ELSE — on a witness the
+# witness wins, because the witness is what owns .env.
+is_collector_host() {
+  if is_product_host || is_witness_host; then return 1; fi
+  [ -f collector.env ] && [ -f docker-compose.collector.yml ]
+}
+
+# Refuse a command that can only work on a product node, and say why. Without this it
+# falls through to `docker compose exec api …`, which prints two dozen "variable is not
+# set" warnings for a stack that was never meant to run here and ends with
+# `service "api" is not running` — an answer that describes the symptom and hides the
+# reason. Observed on the stand.
+needs_product_host() {
+  if is_witness_host; then
+    cat >&2 <<'WITNESSMSG'
+✗ This host is the cluster's WITNESS — it runs etcd only.
+
+  There is no database and no Taranac API here, so the command you ran cannot apply:
+  it reads the cluster's own records or drives its containers, and a witness holds
+  neither. That is by design, not a missing piece — an arbiter you can afford to lose
+  is the whole reason it exists.
+
+  Run it on a DATABASE node instead (the one you ran 'cluster init' on):
+      ./taranac cluster status
+
+  What you CAN do here — this wrapper drives the witness stack:
+      ./taranac ps
+      ./taranac logs -f etcd
+      ./taranac diagnose --ha                                  # snapshot for support
+      docker exec taranac-witness-etcd etcdctl endpoint health
+      ./witness-join.sh --broker … --token … --pin …           # re-point at a cluster
+WITNESSMSG
+    exit 1
+  fi
+  if is_collector_host; then
+    cat >&2 <<'COLLECTORMSG'
+✗ This host runs a standalone NCM COLLECTOR — there is no Taranac core here.
+
+  The command you ran needs the core's API and database. Run it on the core instead.
+
+  What you CAN do here — this wrapper drives the collector stack:
+      ./taranac ps
+      ./taranac logs -f collector
+      ./collector-join.sh --status          # what it is doing, locally
+      ./collector-join.sh --update          # move it to the version its CORE runs
+COLLECTORMSG
+    exit 1
+  fi
+}
+
+cmd_args_have() {  # <ERE> <args…> → 0 when one of the args matches
+  local re="$1" a; shift
+  for a in "$@"; do printf '%s' "${a}" | grep -Eqx -- "${re}" && return 0; done
+  return 1
+}
+
+ha_compose_files() {  # $1 = the passthrough subcommand (then its args); sets the COMPOSE_FILES array
+  # A satellite host has its own single-stack compose file and no HA overlay to merge.
+  if is_witness_host; then
+    COMPOSE_FILES=(-f docker-compose.witness.yml)
+    # Now that these commands reach the arbiter's etcd (before, they acted on a product
+    # stack that does not exist here and did nothing), say what stopping it costs. Not a
+    # prompt — the operator asked, and a wrapper must stay scriptable.
+    if [ "${1:-}" = down ] && cmd_args_have '(-v|--volumes|--volumes=true)' "$@"; then
+      cat >&2 <<'WDOWNV'
+✗ Refusing 'down -v' on the WITNESS. Nothing was stopped.
+  -v deletes the arbiter's etcd data while the ring still counts it as a voter; it then
+  cannot come back as the same member. To stop it and keep it:  ./taranac down
+  To retire this host as the witness, on a database node first:
+      ./taranac cluster remove-witness
+  and then here:
+      ./witness-join.sh --leave
+WDOWNV
+      exit 1
+    fi
+    case "${1:-}" in
+      down|stop|kill)
+        echo "! This host is the cluster's WITNESS — '${1}' stops the arbiter's etcd." >&2
+        echo "  The cluster survives with two votes, but the next DB-node loss then costs" >&2
+        echo "  you quorum. Bring it back with:  ./taranac up -d" >&2 ;;
+    esac
+    return 0
+  fi
+  if is_collector_host; then COMPOSE_FILES=(-f docker-compose.collector.yml); return 0; fi
+  COMPOSE_FILES=(-f docker-compose.yml)
+  ha_is_configured .env || return 0         # standalone → base compose only
+  if [ -f docker-compose.ha.yml ]; then
+    COMPOSE_FILES=(-f docker-compose.yml -f docker-compose.ha.yml)
+    return 0
+  fi
+  case "${1:-}" in
+    up|start|restart|run|create)
+      echo "✗ HA is configured (DB_HOSTS is set in .env) but docker-compose.ha.yml is missing." >&2
+      echo "  Refusing '${1}' on the base compose alone: under HA that starts a second writable" >&2
+      echo "  Postgres on the Patroni-managed data directory → split-brain / data loss." >&2
+      echo "  Restore the overlay from the bundle ('./taranac update'), then retry." >&2
+      exit 1 ;;
+    *)
+      echo "! HA is configured but docker-compose.ha.yml is missing — acting on the base compose" >&2
+      echo "  only. Restore it with './taranac update'." >&2 ;;
+  esac
+}
+
+# A container compose left under its temporary recreate name (`<12 hex>_taranac-db`)
+# is renamed back before any command addresses it — every `docker exec taranac-db`
+# in this bundle and in HA.md depends on the real name, and so does the next
+# recreate of that service. Not for diagnose: the collectors promise to change
+# nothing, and report the leftover instead. See container-names.sh.
+case "${1:-}" in
+  diagnose|version|help|-h|--help|"") ;;
+  *) if [ -f "${HERE}/container-names.sh" ]; then
+       . "${HERE}/container-names.sh"
+       heal_container_names
+     fi ;;
+esac
+
+# A former witness (`witness-join.sh --leave` retired its .env as .env.left-<time>)
+# runs nothing of ours. Said once, instead of compose complaining about a missing
+# .env — or, worse, this host being taken for a product node with no .env yet.
+if [ ! -f .env ] && ls .env.left-* >/dev/null 2>&1; then
+  case "${1:-}" in
+    help|-h|--help|version|update|"") ;;
+    *) echo "This host left its cluster as the witness ($(ls -1t .env.left-* | head -1)) — nothing of Taranac runs here." >&2
+       echo "  To make it a witness again, run the command './taranac cluster add-witness' prints on a database node." >&2
+       exit 1 ;;
+  esac
+fi
+
+# Every subcommand below that ends up inside the api container needs a PRODUCT host.
+# Checked once, from one list, so a subcommand added later cannot forget the guard.
+case "${1:-}" in
+  unlock|reset-password|create-admin|installation-id|reset|cluster) needs_product_host ;;
+esac
+
+case "${1:-}" in
+  # Convenience subcommands handled by the wrapper, not passed to compose:
+  unlock)
+    # Run the account-unlock tool inside the api container so a locked-out
+    # admin can recover without the web UI.
+    [ -f .env ] || { echo "No .env found — run ./install.sh first." >&2; exit 1; }
+    shift
+    exec docker compose --env-file .env -f docker-compose.yml exec -T api \
+      python -m app.scripts.unlock_user "$@"
+    ;;
+  reset-password)
+    # Reset a web-admin password from the console (forgotten admin password).
+    [ -f .env ] || { echo "No .env found — run ./install.sh first." >&2; exit 1; }
+    shift
+    exec docker compose --env-file .env -f docker-compose.yml exec -T api \
+      python -m app.scripts.reset_password "$@"
+    ;;
+  create-admin)
+    # Recover/guarantee an admin login (create-or-repair) when none works.
+    [ -f .env ] || { echo "No .env found — run ./install.sh first." >&2; exit 1; }
+    shift
+    exec docker compose --env-file .env -f docker-compose.yml exec -T api \
+      python -m app.scripts.create_admin "$@"
+    ;;
+  installation-id)
+    # Print this install's immutable installation_id — the value to bind a Pro
+    # license to (send it to TaranacLabs to have a .lic issued).
+    [ -f .env ] || { echo "No .env found — run ./install.sh first." >&2; exit 1; }
+    shift
+    exec docker compose --env-file .env -f docker-compose.yml exec -T api \
+      python -m app.scripts.show_installation_id "$@"
+    ;;
+  reset)
+    # Factory-reset the system (demo stands). Wipes all data and restores the
+    # fresh-install state. Guarded by APP_ENV (demo/dev only) + an explicit
+    # --confirm RESET, and takes a backup before wiping. No args = dry-run plan.
+    [ -f .env ] || { echo "No .env found — run ./install.sh first." >&2; exit 1; }
+    shift
+    exec docker compose --env-file .env -f docker-compose.yml exec -T api \
+      python -m app.scripts.system_reset "$@"
+    ;;
+  cluster)
+    # HA cluster operations (Pro). Two families, dispatched below:
+    #
+    #   BUILDING the cluster — host-side, because they rewrite this host's .env and
+    #   recreate containers, which the api container cannot do (no compose file in
+    #   this product mounts the docker socket) and must not do (the etcd CA private
+    #   key stays on the host, out of any network-facing container):
+    #     ./taranac cluster init                                  # on the future primary
+    #     ./taranac cluster add-witness --address 10.0.0.3        # the arbiter — REQUIRED
+    #     ./taranac cluster add-node    --address 10.0.0.2        # a replica
+    #     ./taranac cluster remove-node --node taranac-node-2     # evict one
+    #     ./taranac cluster remove-witness                        # retire the arbiter
+    #     ./taranac cluster detach                                # THIS node -> standalone
+    #
+    #   OPERATING it — inside the api container, where the DB session, RBAC and the
+    #   audit log are:
+    #     ./taranac cluster status
+    #     ./taranac cluster switchover --to taranac-node-2        # planned handover
+    #     ./taranac cluster join-token --name node-2 --address 10.0.0.2
+    #     ./taranac cluster register | revoke | decommission
+    #
+    # Order matters and is not our invention: ha-convert's second phase requires the
+    # witness to already be a live etcd member, and ha-join refuses a cluster with
+    # fewer than three declared etcd members. init -> add-witness -> add-node.
+    # A witness or collector host never gets here: needs_product_host above turns
+    # every 'cluster' subcommand into one explanation of why this host has neither
+    # the database nor the api those subcommands drive.
+    [ -f .env ] || { echo "No .env found — run ./install.sh first." >&2; exit 1; }
+    shift
+    # ── One list, both families ────────────────────────────────────────────
+    # Without this, `./taranac cluster` (or a typo) falls through to the api
+    # container, whose argparse lists ONLY the subcommands it implements — so the
+    # host-side ones (init, add-witness, add-node, remove-node, detach) are missing
+    # from the very list an operator reads to find them. Observed live: an operator
+    # looking for "remove a node" tried `cluster revoke <address>` three times,
+    # because `revoke` was in the list and `remove-node` was not.
+    case "${1:-}" in
+      ""|-h|--help|help)
+        cat <<'CLUSTERHELP'
+Taranac HA cluster (Pro).
+
+  Building the cluster — run these on the PRIMARY's host:
+    init                          declare the cluster and prepare the conversion
+    add-witness --address ADDR     add the etcd arbiter (REQUIRED before nodes)
+    remove-witness                 take the arbiter out (once there are 3+ DB nodes)
+    add-node    --address ADDR     add a Taranac node
+      --reinstall                  …that is already a member: evict and re-add it
+    sync                          pull the primary's topology onto THIS node
+                                  (run it on a peer the preflight reported stale)
+    remove-node --node NAME        evict a node from the cluster
+    detach                         turn THIS node back into a standalone install
+
+  Operating it:
+    status                        nodes, roles, replication lag
+    verify                        can this cluster survive losing a node?
+      --rehearse                   …prove it by actually handing leadership over
+    connectivity                  prove every node can log in to every other
+    switchover [--to NAME]        hand leadership over (planned)
+               [--force]          force it when the leader is gone (may lose writes)
+    join-token --name N --address A   issue a join token by hand
+    revoke --id ID                revoke a pending join TOKEN (not a node)
+    register --token SECRET       redeem a join token by hand
+    decommission --name NAME      soft-delete a roster row that is a NAME, not a machine
+                                  (a live node or the leader is refused: use remove-node)
+    manifest-publish              store this node's config/cluster.yml in the cluster
+                                  (reads it on stdin; every node can then read it)
+    manifest-fetch                print the cluster's copy (exit 5 if none published)
+    manifest-info                 when it was published, how big, its digest
+
+  Order matters and is enforced by the mechanism, not by us:
+    ./taranac cluster init
+    ./taranac cluster add-witness --address <witness>
+    ./taranac cluster add-node    --address <node>        (once per node)
+
+  Any command above accepts --help for its own options.
+CLUSTERHELP
+        exit 0 ;;
+    esac
+    case "${1:-}" in
+      init|add-witness|add-node|remove-witness|sync)
+        # cluster-wizard.sh calls `./taranac cluster join-token` itself; join-token is
+        # NOT in this dispatch list, so that call falls through to the api container
+        # and cannot recurse back into the wizard.
+        [ -f "${HERE}/cluster-wizard.sh" ] || {
+          echo "cluster-wizard.sh is missing — refresh the bundle once ('./taranac update'), then retry." >&2
+          exit 1
+        }
+        exec bash "${HERE}/cluster-wizard.sh" "$@" ;;
+      remove-node|detach)
+        [ -f "${HERE}/cluster-remove.sh" ] || {
+          echo "cluster-remove.sh is missing — refresh the bundle once ('./taranac update'), then retry." >&2
+          exit 1
+        }
+        sub="$1"; shift
+        case "$sub" in
+          remove-node) exec bash "${HERE}/cluster-remove.sh" "$@" ;;
+          detach)      exec bash "${HERE}/cluster-remove.sh" --detach "$@" ;;
+        esac ;;
+    esac
+    exec docker compose --env-file .env -f docker-compose.yml exec -T api \
+      python -m app.scripts.cluster "$@"
+    ;;
+  restore)
+    # Disaster recovery from a backup archive. Delegates to taranac-restore.sh the
+    # same way version|update delegates to taranac-update.sh — recovery has to edit
+    # host files (.env, ./config) and recreate containers, which a thin
+    # `exec ... exec api` could not do.
+    [ -f "${HERE}/taranac-restore.sh" ] || {
+      echo "taranac-restore.sh is missing — refresh the bundle once, then retry." >&2
+      echo "Download the latest bundle from the project releases and copy it here." >&2
+      exit 1
+    }
+    shift
+    exec bash "${HERE}/taranac-restore.sh" "$@"
+    ;;
+  rotate-key)
+    # Rotate the master encryption key (KEK). Unlike the subcommands above this
+    # is NOT a passthrough into the running api: the stack has to be stopped and
+    # host files (.env, the daemons' master_key volume) have to be rewritten, so
+    # the logic lives in rotate-key.sh — same shape as version|update below.
+    [ -f "${HERE}/rotate-key.sh" ] || {
+      echo "rotate-key.sh is missing — refresh the bundle once ('./taranac update'), then retry." >&2
+      exit 1
+    }
+    shift
+    exec bash "${HERE}/rotate-key.sh" "$@"
+    ;;
+  diagnose)
+    # Collect one device's traffic + logs + config into a support archive.
+    # Host-side like restore|rotate-key, and for the same reason: it captures
+    # packets (needs the host's interfaces and root) and reads containers from
+    # the outside. The api container is used only for the facts that live in
+    # the database — see diagnose.sh's header.
+    [ -f "${HERE}/diagnose.sh" ] || {
+      echo "diagnose.sh is missing — refresh the bundle once ('./taranac update'), then retry." >&2
+      exit 1
+    }
+    shift
+    exec bash "${HERE}/diagnose.sh" "$@"
+    ;;
+  captive-portal)
+    # The portal installed beside this wrapper, addressed by name instead of by
+    # path. It has its own compose project in its own directory, and the
+    # directory above it — this one — holds the core's compose file. A bare
+    # `docker compose ps` run from here therefore does not fail; it quietly
+    # answers about the wrong stack, which is how an operator ends up reading
+    # "no such service: portal" and a screenful of unset core variables. Naming
+    # the thing instead of standing in its directory removes that entirely.
+    #
+    #   ./taranac captive-portal logs -f portal
+    #   ./taranac captive-portal ps
+    #   ./taranac captive-portal restart portal
+    #   ./taranac captive-portal status      # what the installer knows, locally
+    #   ./taranac captive-portal datapath    # what it is enforcing right now
+    #
+    # Anything else is passed straight to compose in that directory, so every
+    # command an operator already knows keeps working.
+    PORTAL_DIR="${TARANAC_PORTAL_DIR:-${HERE}/captive-portal}"
+    # Set before any branch can read it: this script runs under `set -u`, and a
+    # variable assigned only on the path that happens to be taken is how the
+    # last change here died on a real host at step six of six.
+    PORTAL_VERB=""
+    PORTAL_USER_ARGS=""
+    shift
+    # The verbs that RUN the installer come first, because `join` is the one
+    # that creates the directory the rest of this branch insists on.
+    portal_installer() {
+      [ -f "${HERE}/portal-join.sh" ] || {
+        echo "portal-join.sh is missing beside this wrapper — refresh the bundle once." >&2
+        exit 1
+      }
+      # So that anything the installer tells the operator to re-run comes back in
+      # the words they used, not as the raw script this wrapper exists to hide.
+      # The WHOLE command, in the operator's words — not just the program name.
+      # The wrapper injects --dir, so echoing back this function's own arguments
+      # would hand them a flag they did not type and the path the wrapper exists
+      # to keep out of sight.
+      TARANAC_CP_RERUN="$0 captive-portal ${PORTAL_VERB}${PORTAL_USER_ARGS:+ ${PORTAL_USER_ARGS}}" \
+        exec bash "${HERE}/portal-join.sh" "$@"
+    }
+    case "${1:-}" in
+      ""|help|--help|-h)
+        cat <<USAGE
+Usage: ./taranac captive-portal <command>
+
+  join --core <url> --token <token> [--trust-any]
+                      install (or re-install) the portal on THIS host; the core
+                      prints this line ready to paste, under
+                      NAC -> Captive Portals -> <portal> -> Deployment
+  status              trust, token, heartbeat and datapath, from local state only
+  datapath            the rules, the allowed clients and the speed limits in force
+  logs -f portal      follow it: pinning, portal.conf, heartbeats
+  ps                  health = 'healthy' once nginx answers
+  restart portal      check the certificate in certs/, then re-read portal.conf and
+                      restart; refuses if that certificate cannot be served
+  update [--check]    move this portal to the version its core runs
+  reset-trust         accept the core's certificate again after a real replacement
+  uninstall           remove the portal, and its datapath, from this host
+
+Anything else is handed to docker compose in ${PORTAL_DIR}.
+USAGE
+        exit 0 ;;
+      join)        PORTAL_VERB=join;        shift; PORTAL_USER_ARGS="$*"; portal_installer --dir "$PORTAL_DIR" "$@" ;;
+      update)      PORTAL_VERB=update; shift; PORTAL_USER_ARGS="$*"; portal_installer --update      --dir "$PORTAL_DIR" "$@" ;;
+      reset-trust) PORTAL_VERB=reset-trust; shift; PORTAL_USER_ARGS="$*"; portal_installer --reset-trust --dir "$PORTAL_DIR" "$@" ;;
+      uninstall)   PORTAL_VERB=uninstall; shift; PORTAL_USER_ARGS="$*"; portal_installer --uninstall   --dir "$PORTAL_DIR" "$@" ;;
+    esac
+    [ -d "$PORTAL_DIR" ] || {
+      echo "No captive portal is installed beside this wrapper (${PORTAL_DIR} is not there)." >&2
+      echo "Install one:  ./taranac captive-portal join --core <url> --token <token>" >&2
+      echo "or point this at an existing install:" >&2
+      echo "  TARANAC_PORTAL_DIR=/path/to/install ./taranac captive-portal ..." >&2
+      exit 1
+    }
+    PORTAL_COMPOSE=(docker compose --project-directory "$PORTAL_DIR" -f "${PORTAL_DIR}/docker-compose.yml")
+    # One checker, two callers: this wrapper and the container's own entrypoint.
+    # It lives in the IMAGE, because the entrypoint needs it at boot and the host
+    # is not required to have openssl — so the wrapper runs it in a throwaway
+    # container against the very files the real one mounts. Written twice it
+    # would drift, and a check that answered two ways has cost this product an
+    # issue three times over.
+    #
+    # `run` publishes no ports, so it cannot collide with the portal that is
+    # serving right now.
+    portal_check_certs() {
+      local names
+      names="$(sed -n 's/^PORTAL_SELF_NAMES=//p' "${PORTAL_DIR}/.env" 2>/dev/null | head -1)"
+      "${PORTAL_COMPOSE[@]}" run --rm --no-deps -T \
+        --entrypoint /opt/scripts/check-certs.sh portal /etc/nginx/certs "${names}"
+    }
+    case "${1:-}" in
+      status)
+        PORTAL_VERB=status; portal_installer --status --dir "$PORTAL_DIR" ;;
+      restart)
+        # Replacing a certificate and restarting is one sequence, always. So the
+        # certificate is judged BEFORE anything is taken down: a typo then costs
+        # nothing, because the portal that is serving guests goes on serving them
+        # while it is fixed. This is the one command where refusing is kinder
+        # than obeying — measured the hard way, when a correct certificate with
+        # two spaces in front of its PEM header replaced a working one and took
+        # the portal into a restart loop.
+        shift
+        if ! portal_check_certs; then
+          echo >&2
+          echo "Not restarting: that certificate cannot be served." >&2
+          echo "The portal running now is untouched and still serving guests. Fix the files" >&2
+          echo "in ${PORTAL_DIR}/certs and run this again." >&2
+          exit 1
+        fi
+        "${PORTAL_COMPOSE[@]}" restart "${@:-portal}"
+        # "Started" is what compose says; it means a container was created. What
+        # an operator wants to know is whether nginx answers, so that is what is
+        # waited for — and when it does not, the reason is printed here instead
+        # of being left in a log for them to go and find.
+        printf 'waiting for the portal to answer'
+        portal_ok=0
+        for _ in $(seq 1 30); do
+          if "${PORTAL_COMPOSE[@]}" ps --format '{{.Status}}' 2>/dev/null | grep -q healthy; then
+            portal_ok=1; break
+          fi
+          printf '.'; sleep 2
+        done
+        echo
+        if [ "$portal_ok" -eq 1 ]; then
+          echo "portal: up and answering."
+          exit 0
+        fi
+        echo "portal: it did not come up healthy. The last thing it said:" >&2
+        "${PORTAL_COMPOSE[@]}" logs --tail 15 portal 2>&1 | sed 's/^/  /' >&2
+        exit 1 ;;
+      datapath)
+        # From inside the container on purpose. It shares this host's network
+        # namespace and carries iptables, ipset and tc; the host is not required
+        # to have any of them, and a correctly installed one usually does not.
+        # `tc class show` needs a device, and the one that matters is the guests'
+        # — which the install already wrote down, so it is read rather than asked
+        # for again. Unreadable .env is not a failure: the other two still answer.
+        PORTAL_IF="$(sed -n 's/^DHCP_INTERFACE=//p' "${PORTAL_DIR}/.env" 2>/dev/null | head -1)"
+        for probe in "iptables -S TGW_FWD" "ipset list tgw_auth" \
+                     "${PORTAL_IF:+tc -s class show dev ${PORTAL_IF}}"; do
+          [ -n "$probe" ] || continue
+          printf '\n== %s ==\n' "$probe"
+          # shellcheck disable=SC2086
+          "${PORTAL_COMPOSE[@]}" exec -T portal $probe 2>&1 || true
+        done
+        [ -n "$PORTAL_IF" ] || echo "(the guests' interface is not readable from ${PORTAL_DIR}/.env — skipping the shaper)" >&2
+        exit 0 ;;
+      *)
+        exec "${PORTAL_COMPOSE[@]}" "$@" ;;
+    esac
+    ;;
+  version|update)
+    # Self-update: refreshes BOTH images and the bundle files (this wrapper,
+    # compose, install.sh, docs). Logic lives in taranac-update.sh.
+    [ -f "${HERE}/taranac-update.sh" ] || {
+      echo "taranac-update.sh is missing — refresh the bundle once, then retry." >&2
+      echo "Download the latest bundle from the project releases and copy it here." >&2
+      exit 1
+    }
+    exec bash "${HERE}/taranac-update.sh" "$@"
+    ;;
+esac
+
+# The collector interpolates from its OWN env file (.env.collector, written by
+# collector-join.sh) and a collector-only host may have no .env at all — so resolve
+# the role BEFORE demanding one, or a host that is perfectly healthy gets told to
+# "run ./install.sh first".
+if is_collector_host; then
+  ENV_ARG=(--env-file .env.collector)
+else
+  [ -f .env ] || { echo "No .env found — run ./install.sh first." >&2; exit 1; }
+  ENV_ARG=(--env-file .env)
+fi
+ha_compose_files "$@"
+
+# ── Off-plan starts and stops on a cluster node, refused or said BEFORE compose ──
+# Each of these was a way to break a cluster with one ordinary-looking command, and
+# each needed a repair outside our commands afterwards. So the wrapper answers first:
+# what is wrong, what it would cause, the one command that is right instead.
+envv() { sed -n "s/^[[:space:]]*\(export[[:space:]]\{1,\}\)\{0,1\}$1[[:space:]]*=[[:space:]]*//p" .env 2>/dev/null \
+           | tail -1 | sed -e 's/[[:space:]]*$//' -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/"; }
+# Services named on the command line (not flags, not the subcommand itself).
+named_services() { local a; shift; for a in "$@"; do case "${a}" in -*) ;; *) printf '%s\n' "${a}" ;; esac; done; }
+
+# "Is this address mine" and "read one key from etcd" have ONE definition in the
+# bundle, in cluster-versions.sh (the updater's etcd client: ETCD_CLIENT_CACERT, the
+# local member first). Missing file = a half-updated bundle: neither guard applies.
+[ -f "${HERE}/cluster-versions.sh" ] && . "${HERE}/cluster-versions.sh"
+address_is_local() { type cv_address_is_local >/dev/null 2>&1 || return 2; cv_address_is_local "$1"; }
+etcd_get_value() {  # <key> → the value, or nothing (never waits on a pull)
+  type _cv_etcdctl_once >/dev/null 2>&1 || return 0
+  cv_init "${HERE}" "${HERE}/.env" db
+  # With no local member running, a one-shot etcdctl only if its image is already
+  # here — an `up` must not start with a download, nor wait on an offline registry.
+  if ! _cv_local_etcd >/dev/null 2>&1; then
+    docker image inspect "$(_cv_etcd_image)" >/dev/null 2>&1 || return 0
+  fi
+  _cv_etcdctl_once get "$1" --print-value-only 2>/dev/null || true
+}
+# The host of a Patroni conn_url: postgres://10.0.0.1:5432/… or postgres://[fd00::1]:5432/…
+conn_url_host() {
+  local u; u="$(printf '%s' "$1" | sed -n 's/.*"conn_url"[[:space:]]*:[[:space:]]*"postgres[a-z]*:\/\/\([^/"]*\).*/\1/p' | head -1)"
+  case "${u}" in
+    \[*) u="${u#[}"; printf '%s' "${u%%]*}" ;;
+    *)    printf '%s' "${u%%:*}" ;;
+  esac
+}
+
+product_ha_guards() {  # <subcommand> <args…>
+  is_product_host || return 0
+  local sub="${1:-}"
+  local ha_marker=""; [ "$(envv TARANAC_HA)" = 1 ] && ha_marker=1
+
+  # №11 — `down -v` deletes the named volumes: the database, the etcd data, the backups
+  # and the master key. Under HA there is no situation it is the right command for; on
+  # a standalone install it is a deliberate factory wipe and says so in words.
+  if [ "${sub}" = down ] && cmd_args_have '(-v|--volumes|--volumes=true)' "$@"; then
+    if ha_is_configured .env; then
+      cat >&2 <<'DOWNV'
+✗ Refusing 'down -v' on a cluster node. Nothing was stopped.
+
+  -v deletes this node's volumes: its database, its etcd data, its backups and its
+  master key. On a cluster with one database node that is ALL of the data; on any
+  cluster it takes a voting member's state away without telling the ring.
+
+  What you probably want instead:
+      ./taranac down                                   stop this node, keep its data
+      ./taranac cluster remove-node --node <name>      take a node out (on a database node)
+      ./ha-deconvert.sh                                go back to one standalone server
+DOWNV
+      exit 1
+    fi
+    if ! cmd_args_have '--confirm=DELETE-ALL-DATA' "$@" && [ "${TARANAC_CONFIRM:-}" != DELETE-ALL-DATA ]; then
+      cat >&2 <<'DOWNVS'
+✗ 'down -v' deletes this installation's data: the database, the backups and the
+  master key. Nothing was stopped.
+
+  To stop the stack and keep the data:   ./taranac down
+  To really wipe it, say so in words:    ./taranac down -v --confirm=DELETE-ALL-DATA
+DOWNVS
+      exit 1
+    fi
+  fi
+
+  case "${sub}" in
+    up|start|restart|create|run)
+      # №1 — the cluster is declared in .env (DB_HOSTS) and the etcd CA is here, but this
+      # node never finished becoming a member. Started now, the overlay brings Patroni up
+      # waiting for a ring that does not exist yet: database, UI and AAA all down. Two
+      # ways to get here, with different next commands: the SEED between `cluster init`
+      # and `add-witness` (it holds the manifest init wrote), or a JOINER whose
+      # ha-join.sh stopped before its last step.
+      if [ -z "${ha_marker}" ] && ha_is_configured .env && [ -d config/etcd-ca ]; then
+        if [ -f config/cluster.yml ]; then
+          cat >&2 <<'HALFWAY'
+✗ This node is half-way into a cluster: 'cluster init' has run, the conversion has not.
+  Nothing was started. Starting the stack now brings Patroni up waiting for an etcd
+  ring that does not exist yet, and this node's database, UI and AAA stay down.
+
+  The next command finishes the conversion and starts everything:
+      ./taranac cluster add-witness --address <the witness host>
+  Or, to give up on the cluster and run this node standalone again (its data is untouched):
+      ./ha-deconvert.sh --abandon
+HALFWAY
+        else
+          local me; me="$(envv NODE_ADDRESS)"; me="${me:-<this node>}"
+          cat >&2 <<HALFJOIN
+✗ This node's join did not finish: ha-join.sh stopped before making it a member.
+  Nothing was started. Starting the stack now brings Patroni up for a cluster this node
+  is not part of, and its database, UI and AAA stay down.
+
+  To finish the join — on the primary, then paste the command it prints here:
+      ./taranac cluster add-node --address ${me}
+  Or, to give up on the join and run this node standalone again:
+      ./ha-deconvert.sh --abandon
+HALFJOIN
+        fi
+        exit 1
+      fi
+      # №13 — the HA lines were removed from .env by hand (or the bundle directory was
+      # replaced), but this host still holds a cluster member's etcd state. Its
+      # database is Patroni's; started on the base compose it is a second, writable
+      # copy of the cluster's data. ha-deconvert and detach remove that state, so a
+      # node they turned standalone never meets this.
+      if ! ha_is_configured .env && docker volume inspect taranac_etcd_data >/dev/null 2>&1; then
+        cat >&2 <<'HALINES'
+✗ This .env is standalone, but this host still holds an HA cluster member's etcd state
+  (docker volume taranac_etcd_data): its database is Patroni's. Nothing was started.
+  Started standalone it would be a second, writable copy of the cluster's data.
+
+  · Still a member: put the HA lines back into .env (TARANAC_HA=1 and the cluster keys,
+    from .env.bak-* or .taranac-backup-*/.env), then:   ./taranac up -d
+  · Leaving the cluster: on a database node   ./taranac cluster remove-node --node <this node>,
+    or — if this is the last node — put the HA lines back and run   ./ha-deconvert.sh
+  · Already detached, and only this leftover remains:   docker volume rm taranac_etcd_data
+HALINES
+        exit 1
+      fi
+      [ -n "${ha_marker}" ] || return 0
+
+      # №15 — TARANAC_VERSION edited by hand: the images of one version with the bundle
+      # files of another, outside the cluster's update order.
+      local pin bundle_ver
+      pin="$(envv TARANAC_VERSION)"; bundle_ver="$(head -1 VERSION 2>/dev/null | tr -d "[:space:]" || true)"
+      if [ -n "${pin}" ] && [ -n "${bundle_ver}" ] && [ "${pin}" != "${bundle_ver}" ]; then
+        cat >&2 <<VERMIX
+✗ TARANAC_VERSION in .env is ${pin}, but this bundle is ${bundle_ver}. Nothing was started.
+  A cluster changes version one node at a time, in its order (replicas, the leader,
+  the witness) — an edited pin would run ${pin}'s images with ${bundle_ver}'s files, outside it.
+
+  To move this node to ${pin}:        ./taranac update --version ${pin}
+  To keep ${bundle_ver}, put the line back:  TARANAC_VERSION=${bundle_ver}   (then ./taranac ${sub} again)
+VERMIX
+        exit 1
+      fi
+
+      # №16 — a REPLICA waiting for the leader's schema: its finisher starts the api's
+      # dependants by itself once the api is healthy, and an `up` of those now only hangs
+      # on the api. Never the leader (a finisher waits there too, on its own migration),
+      # never a command naming postgres or etcd (the finisher starts neither), and only
+      # while the pin still names the finisher's version — a node rolled back by hand is
+      # the operator's again.
+      local fin_ver svcs_up
+      fin_ver="$(docker inspect --format '{{index .Config.Cmd 1}}' taranac-update-finisher 2>/dev/null </dev/null || true)"
+      svcs_up="$(named_services "$@")"
+      if [ -n "${fin_ver}" ] && [ "${fin_ver}" = "${pin}" ] \
+         && { [ -z "${svcs_up}" ] || ! printf '%s\n' "${svcs_up}" | grep -Eqx 'postgres|etcd'; } \
+         && docker exec taranac-db psql -U taranac -d taranac -tAc 'select pg_is_in_recovery()' 2>/dev/null </dev/null | grep -qi '^t'; then
+        cat >&2 <<AWAIT
+✗ This replica is waiting for the leader's new schema (its update to ${pin} is in progress).
+  Nothing was started: its api cannot become healthy before the leader is updated, so
+  this command would only wait and fail. The update finisher already here starts the
+  rest by itself the moment it can.
+
+  Next — update the LEADER (find it with ./taranac cluster status):
+      ./taranac update --version ${pin}
+AWAIT
+        exit 1
+      fi
+
+      # №14 — a .env that belongs to another machine: copied, a cloned VM, or this
+      # host's address changed. NODE_ADDRESS is what Patroni advertises and what every
+      # member connects to; a second machine under the same name takes over the
+      # other's identity in the ring — two writers.
+      local addr name scope v holder
+      addr="$(envv NODE_ADDRESS)"; name="$(envv TARANAC_NODE_NAME)"; scope="$(envv TARANAC_CLUSTER_NAME)"
+      if [ -n "${addr}" ] && [ "$(envv ADDRESS_NOT_LOCAL_OK)" != 1 ]; then
+        v=0; address_is_local "${addr}" || v=$?
+        if [ "${v}" = 1 ]; then
+          cat >&2 <<NOTLOCAL
+✗ NODE_ADDRESS=${addr} in .env is not an address of this host. Nothing was started.
+  This .env names a cluster member at ${addr}${name:+ ('${name}')}. On this machine it
+  means one of three things:
+    · the .env (or the whole VM) was copied from that member — starting it would put a
+      second machine into the cluster under that member's identity;
+    · this host's address changed — the cluster still reaches it at ${addr};
+    · it is reached through NAT at an address it does not hold itself.
+  If this host's address changed: give it its old address back (${addr}), then
+      ./taranac ${sub} again
+  To really move a member to a new address, take it out and add it again, on a database
+  node (switch the leader over first; with one database node, go standalone first):
+      ./taranac cluster remove-node --node ${name:-<this node>}
+      ./taranac cluster add-node --address <its new address>
+  Only for NAT (the cluster really reaches this host at ${addr}), say so in .env once:
+      ADDRESS_NOT_LOCAL_OK=1
+NOTLOCAL
+          exit 1
+        fi
+      fi
+      if [ -n "${name}" ] && [ -n "${scope}" ] && [ -n "${addr}" ]; then
+        v="$(etcd_get_value "/service/${scope}/members/${name}")"
+        holder="$(conn_url_host "${v}")"
+        if [ -n "${holder}" ] && [ "${holder}" != "${addr}" ]; then
+          cat >&2 <<DUPNAME
+✗ Another machine is running in this cluster as '${name}' — at ${holder}, not ${addr}.
+  Nothing was started. Two machines under one member name take turns at one identity:
+  the ring cannot tell them apart, and each may believe it holds the leader's key.
+
+  If ${holder} is the real '${name}', this host's .env is a copy: do not start it here.
+  If THIS host is meant to be '${name}' at ${addr}, take the old one out first, on a
+  database node, then add this one:
+      ./taranac cluster remove-node --node ${name}
+      ./taranac cluster add-node --address ${addr}
+DUPNAME
+          exit 1
+        fi
+      fi
+      ;;
+    down|stop|kill)
+      # №12 — stopping the leader's database hands leadership over without asking (and
+      # on a single database node, stops writes). Said once, not prompted: a wrapper
+      # must stay scriptable, and stopping it may be exactly what was meant.
+      [ -n "${ha_marker}" ] || return 0
+      local svcs; svcs="$(named_services "$@")"
+      if [ -n "${svcs}" ] && ! printf '%s\n' "${svcs}" | grep -Eqx 'postgres|etcd'; then return 0; fi
+      if docker exec taranac-db psql -U taranac -d taranac -tAc 'select not pg_is_in_recovery()' 2>/dev/null </dev/null | grep -qi '^t'; then
+        echo "! This node is the cluster's LEADER. '${sub}' hands leadership to another node (a failover)," >&2
+        echo "  and with only one database node the cluster stops accepting writes until it is back." >&2
+        echo "  The planned way, with no failover:  ./taranac cluster switchover   (then '${sub}' here)" >&2
+      fi ;;
+  esac
+  return 0
+}
+product_ha_guards "$@"
+# The confirmation word of `down -v` is the wrapper's, not compose's.
+if [ "${1:-}" = down ]; then
+  _args=(); for _a in "$@"; do [ "${_a}" = "--confirm=DELETE-ALL-DATA" ] || _args+=("${_a}"); done
+  set -- "${_args[@]}"
+fi
+# A pending update finisher (an HA update waiting for the leader's schema) runs the
+# last `up -d` when this node's api turns healthy — after a `down` that would start
+# the whole stack again behind the operator's back. Stopping the stack ends it; the
+# next `./taranac update` on this node starts it again if the update still needs it.
+case "${1:-}" in
+  down|stop|kill)
+    if docker inspect taranac-update-finisher >/dev/null 2>&1; then
+      docker rm -f taranac-update-finisher >/dev/null 2>&1 || true
+      echo "! Removed the pending update finisher (taranac-update-finisher): it would have started the stack" >&2
+      echo "  again once the api was healthy. To finish that update later:  ./taranac update" >&2
+    fi ;;
+esac
+exec docker compose "${ENV_ARG[@]}" "${COMPOSE_FILES[@]}" "$@"

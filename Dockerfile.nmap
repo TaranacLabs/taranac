@@ -1,0 +1,47 @@
+# The supported way to give a collector nmap.
+#
+# Taranac does not ship nmap: redistributing it commercially requires a paid OEM
+# agreement with its authors, so the package is never inside anything we hand
+# out. This file builds an image ON THE CUSTOMER'S OWN HOST, from their own
+# distribution mirrors, on top of the collector image they already have.
+#
+# `collector-join.sh` offers to do this for you when the collector is being set
+# up as a scanner; it passes BASE_IMAGE so the derived image tracks whatever
+# version this install is pinned to. By hand:
+#
+#   docker build --build-arg BASE_IMAGE=taranac-collector:1.3.2 \
+#                -t taranac-collector:1.3.2-nmap -f Dockerfile.nmap .
+#   # then put COLLECTOR_IMAGE=taranac-collector:1.3.2-nmap in .env.collector
+#
+# Nothing else changes: the collector finds nmap on PATH by itself and starts
+# offering the Deep scan level on its next report to the core.
+ARG BASE_IMAGE=taranac-collector:latest
+FROM ${BASE_IMAGE}
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends nmap libcap2-bin \
+    && rm -rf /var/lib/apt/lists/*
+
+# nmap needs capabilities of its own, and this line is the difference between a deep scan
+# that works and one that reports "TCP/IP fingerprinting (for OS scan) requires root
+# privileges" — found by running it, not by reading the manual.
+#
+# The collector runs unprivileged (the entrypoint drops to the `collector` user), and the
+# capabilities granted to the Python interpreter do not travel to a binary it executes. So
+# nmap is granted its own:
+#
+#   cap_net_raw            raw sockets — the SYN scan and the OS fingerprint
+#   cap_net_bind_service   binding a low source port, which some probes use
+#
+# NOT cap_net_admin, although nmap's own documentation lists it. A file capability that is
+# absent from the container's bounding set cannot be raised at exec time, and the kernel
+# does not degrade gracefully: it refuses the exec outright, so `nmap --version` answers
+# "Operation not permitted" and every scan fails before nmap has run a line. Docker's
+# default bounding set has NET_RAW and NET_BIND_SERVICE and does NOT have NET_ADMIN, so
+# naming it here breaks nmap completely in exchange for a privilege -O does not need. An
+# installation that really wants it must widen the container as well as the binary
+# (`cap_add: NET_ADMIN`), and that is a decision for whoever owns the host, not a default.
+#
+# Granted HERE and not in the base image, deliberately: this is the layer an installation
+# adds by choosing to have nmap, and choosing the tool is choosing what the tool needs.
+# The base image still grants the interpreter nothing beyond raw sockets.
+RUN setcap cap_net_raw,cap_net_bind_service+eip /usr/bin/nmap

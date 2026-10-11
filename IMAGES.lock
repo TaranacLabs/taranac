@@ -1,0 +1,20 @@
+# Taranac 1.3.2 — the images this release runs, by content digest.
+# Checked by ./taranac update after the pull and before anything is pinned or restarted.
+# ${IMAGE_PREFIX} is literal: the digest is the same in every registry the images are
+# copied to with a digest-preserving tool. Third-party images are pinned to these digests
+# in the bundle's compose files.
+${IMAGE_PREFIX}/api:1.3.2@sha256:731ce9fb92d48333c29f12f2911a0f77b6d7e7d2a9c2cc8824e14c244b709ecf
+${IMAGE_PREFIX}/frontend:1.3.2@sha256:bbfaaa42b99a7966804c0d30cf783c681121d92db51ca966e5879802911454ab
+${IMAGE_PREFIX}/edge:1.3.2@sha256:f742681356ff8c940e6763e12470bda5ed28aa47371e320699c8c3fafef4bb71
+${IMAGE_PREFIX}/mfa:1.3.2@sha256:5dcd1f0bc311e0bb8a613bf9bd2efde2ee5809f8502cb74159acda5654116921
+${IMAGE_PREFIX}/tacacs:1.3.2@sha256:84b8f609dec2b28fe20bd0e0b628e446fe95cea3ee6c0b64407ba99cf41791cb
+${IMAGE_PREFIX}/radius:1.3.2@sha256:2df129bd5b570b7ccfd974a9b860d7fd3aedf5fb3e017aeffc4b7ece8e3374b1
+${IMAGE_PREFIX}/nac:1.3.2@sha256:398d92fa7b959d7587751ddb6ade0a1e1a8e0100cca84e50912459c99ecabcdb
+${IMAGE_PREFIX}/captive-portal:1.3.2@sha256:b44648ab85c77979c8b1a39e0de1371166eb1ae272753806209849d26c2a78c3
+${IMAGE_PREFIX}/renderer:1.3.2@sha256:8a786a91f6f2e6c3467d6fd1067ce4aa8bd14f911d1b3bdf3cbe3cd1f3029302
+${IMAGE_PREFIX}/winbind:1.3.2@sha256:085cd805a0c85d8683ff2b8cb96b0d97a2c440df5eab4d227ac466eebe7a6cc5
+${IMAGE_PREFIX}/postgres-ha:1.3.2@sha256:45503344c30d160fea5d868d93ac27f527df779fdd394b15415fc13422fbc5cf
+${IMAGE_PREFIX}/collector:1.3.2@sha256:cf3e54f2debd9c884b4d502118bbf4c621a68db90f560c3333c31f7db469173f
+docker:27.5.1-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
+postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+quay.io/coreos/etcd:v3.5.17@sha256:a055da833a7c013b836ed0822e8ec1f99b059658be255ad8d0fcd31b635ae3d6
