@@ -1,0 +1,90 @@
+# docker-compose.collector.yml — Taranac standalone collector (deployable form)
+#
+# One collector per remote site. It dials home to the core over a verified,
+# request-signed channel, claims dispatched collection jobs, runs them locally
+# against the site's devices, and posts results back through a durable
+# store-and-forward outbox. It holds NO database, serves no API and publishes no
+# port — every connection it makes is outbound.
+#
+# This is the OPERATOR's copy: it names the PUBLISHED image and never builds.
+# (The in-repo `docker-compose.collector.yml` at the monorepo root builds from
+# source and is for development only — an installed site has no source tree, and
+# an appliance has no registry access either. COLLECTOR_IMAGE lets an air-gapped
+# host point at an image already on disk.)
+#
+# Operators do not normally edit this file by hand — `taranac-module` (appliance)
+# or `collector-join.sh` writes ./collector.env + ./enrollment-token and brings
+# this up, from the one command the core's enrollment dialog hands over.
+#
+# TLS trust needs no file by default: the collector pins the core's certificate
+# on first contact. Supplying a CA bundle remains available and is stricter.
+#
+# The persisted state (identity key/cert/fingerprint, the pinned core
+# certificate, the outbox SQLite) all lives under the single named volume so a
+# restart resumes cleanly.
+name: taranac-collector
+
+services:
+  collector:
+    container_name: taranac-collector
+    image: ${COLLECTOR_IMAGE:-ghcr.io/taranaclabs/taranac/collector:${TARANAC_VERSION:-latest}}
+    # COLLECTOR_* values come from the env file the join step writes. The two
+    # required key (core URL), the trust choice and the poll cadence live there; the
+    # rest fall back to the image's own defaults.
+    env_file:
+      - ./collector.env
+    environment:
+      # Container-side paths only. The site-specific values (core URL, and
+      # COLLECTOR_CA_CERT_PATH when an operator supplies a CA) are written into
+      # collector.env by the join step — keeping them out of here means
+      # `environment:` never silently overrides what the operator configured.
+      COLLECTOR_ENROLLMENT_TOKEN_FILE: /etc/taranac-collector/enrollment-token
+      COLLECTOR_IDENTITY_DIR: /var/lib/taranac-collector/identity
+      COLLECTOR_OUTBOX_PATH: /var/lib/taranac-collector/outbox.sqlite3
+      COLLECTOR_LIVENESS_PATH: /var/lib/taranac-collector/alive
+    volumes:
+      # Durable state: identity (key.pem 0600 / cert.pem / fingerprint), the
+      # pinned core certificate + the store-and-forward outbox. MUST persist
+      # across restarts.
+      - collector_state:/var/lib/taranac-collector
+      # OPTIONAL operator CA bundle. Compose cannot omit a mount conditionally,
+      # so the source defaults to /dev/null — an always-present path that mounts
+      # harmlessly and is never read, because COLLECTOR_CA_CERT_PATH is only set
+      # when an operator actually supplied a CA. Behind an nginx edge that CA is
+      # the EDGE CA, not the internal one.
+      - ${COLLECTOR_CA_FILE:-/dev/null}:/etc/taranac-collector/ca.crt:ro
+      # One-shot enrollment token (redeemed once, then the daemon blanks it).
+      # Writable so the daemon can spend it after a successful enroll.
+      - ./enrollment-token:/etc/taranac-collector/enrollment-token
+    # The site's own network, not a bridge, and this is what makes the DHCP
+    # listening point reachable at all.
+    #
+    # A relay always sends to UDP/67, and a client broadcasts a DISCOVER from
+    # source 0.0.0.0. Under a bridge network the first needs a published port and
+    # the second arrives through Docker's userland proxy with the source address
+    # rewritten — which is precisely how narrowing the relay allow-list once
+    # switched off all collection (commit d2247bd4). Publishing 67 would fix the
+    # relayed half and quietly break the broadcast half.
+    #
+    # The default is `host` because a collector has no inbound service, no
+    # compose peers to resolve by name and no port of its own unless the probe is
+    # on, so the namespace was buying very little — while a switch an operator
+    # has to find and set is the switch that is missing on the day a relay is
+    # pointed at them. Set COLLECTOR_NETWORK_MODE=bridge to keep the old
+    # isolation, and accept that the DHCP listening point is then unreachable.
+    #
+    # No `ports:` section: Docker ignores one under host networking and only
+    # emits a warning, so it would be a promise this file cannot keep.
+    network_mode: ${COLLECTOR_NETWORK_MODE:-host}
+    restart: unless-stopped
+    # Healthcheck is baked into the image (liveness-file mtime freshness); the
+    # default 30s poll interval keeps `alive` fresh. Overridable via
+    # COLLECTOR_HEALTH_MAX_AGE_S if you widen COLLECTOR_POLL_INTERVAL_S.
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+volumes:
+  collector_state: {}

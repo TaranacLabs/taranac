@@ -1,0 +1,22 @@
+# Taranac 1.3.5 — the images this release runs, by content digest.
+# Checked by ./taranac update after the pull and before anything is pinned or restarted.
+# ${IMAGE_PREFIX} is literal: the digest is the same in every registry the images are
+# copied to with a digest-preserving tool. Third-party images are pinned to these digests
+# in the bundle's compose files.
+${IMAGE_PREFIX}/api:1.3.5@sha256:0d779382cd50916ef2fe639b57e6c3f9b969091c3bf798640301c5422bf6e45e
+${IMAGE_PREFIX}/frontend:1.3.5@sha256:23bac396b9c20f266d64bdb60f66b1ceb8e69494535c465ee6afc8cbd84dc8f0
+${IMAGE_PREFIX}/edge:1.3.5@sha256:6dac802eddb58bbeb5f8ce07572e642471fe0532888ee48d207baa221415fc73
+${IMAGE_PREFIX}/mfa:1.3.5@sha256:a6f987ecbf40a1c7694b3584a07e1d6b9a121334c56fe75b46c26deed3209d8e
+${IMAGE_PREFIX}/tacacs:1.3.5@sha256:03d3a009ea3f4febd79c868fcf2ae78bb4837b4a360a1568681328f3cdcd4bac
+${IMAGE_PREFIX}/radius:1.3.5@sha256:776f5c4e88261351d8ff8804d3b5201d7e8ca672dd3a252a95c4f3ed338049d5
+${IMAGE_PREFIX}/nac:1.3.5@sha256:3bc40ddbd9edd788d31246bbf2912314e0473c6293191d913ade850ac3121356
+${IMAGE_PREFIX}/captive-portal:1.3.5@sha256:91dd4cb49ff9d4ee952317f4aeaca832c4db1b094f269e71f57b0408b7b81592
+${IMAGE_PREFIX}/renderer:1.3.5@sha256:55ced46f1c462efcf3c71b13ec5db9a98375d55cba42eec07886c75c64534766
+${IMAGE_PREFIX}/winbind:1.3.5@sha256:ff912a02deae366027e3b83152749346dae17bcaa76a669e3267ea9fdf47718d
+${IMAGE_PREFIX}/est-gateway:1.3.5@sha256:00e6f83476bde69dd64bafa30805fbd7232e94715a38e2a545f4843d337ab0f8
+${IMAGE_PREFIX}/postgres-ha:1.3.5@sha256:dca34d0205ddf0118a9b0a5cebbe0df63fbffd4583a36ae2d33661272d8075d2
+${IMAGE_PREFIX}/etcd-agent:1.3.5@sha256:321c22497123f4e7718a84148e4a6f65102058c6575d674cf8b8edfd2ae7a224
+${IMAGE_PREFIX}/collector:1.3.5@sha256:8261ad3065a4f85b3bb673a036c1dc696297a01b1670c5232eb087f92afd6c1d
+docker:27.5.1-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
+postgres:16-alpine@sha256:f377d590e5474681d4d7838635031a2b50647923b7abfa803ce9b5ff35d5c663
+quay.io/coreos/etcd:v3.5.17@sha256:a055da833a7c013b836ed0822e8ec1f99b059658be255ad8d0fcd31b635ae3d6

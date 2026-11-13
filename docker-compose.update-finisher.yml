@@ -1,0 +1,62 @@
+# =============================================================================
+# Taranac — the update finisher (HA DB nodes only). Started by `./taranac update`,
+# never by hand; it removes itself when its work is done.
+#
+# WHY A CONTAINER
+#   On an HA DB node an update recreates the whole stack on the new images, starts
+#   the api, and then has to wait: the api is healthy only once the schema matches
+#   its code, and on a replica that happens when the LEADER is updated — on another
+#   machine, by the operator's next step. Everything that depends on the api (the
+#   UI, tacacs/radius/nac, …) is held in Created until then by `depends_on:
+#   service_healthy`, deliberately, so new daemons never serve against an old
+#   schema. A container that is only Created is never started by its restart
+#   policy; only compose starts it. So something with compose has to stay behind,
+#   wait for the api, and run the last `up -d`.
+#
+#   A process on the host would die with the operator's session or a reboot. This
+#   container does not: `restart: unless-stopped` brings it back after a reboot
+#   (measured — on-failure does NOT: a container running at reboot came back
+#   Exited (0)), and it is independent of any login. It removes itself when done. The price is
+#   the Docker socket — root-equivalent on this host, the same power the updater
+#   that starts it already has — a deliberate, owner-approved trade.
+#
+# WHAT IT RUNS
+#   update-finisher.sh from this bundle — POSIX sh, because the docker:*-cli image
+#   is Alpine with busybox and no bash. It waits for taranac-api to be healthy
+#   (polled every 15 s, ceiling 24 h), starts exactly the services that are not
+#   running with the updater's own arguments (base compose + HA overlay) and
+#   `up -d --no-recreate --no-deps <those>` — never etcd, postgres or the api, and
+#   nothing that runs is recreated, because its compose is not the host's and
+#   computes other config hashes — checks every service is running, records state=updated for
+#   this node in etcd and removes its own container. A ceiling
+#   reached records state=failed with the reason, which the next `./taranac update`
+#   anywhere in the cluster shows.
+#
+# The bundle directory is mounted at the SAME path it has on the host, so the
+# relative paths of the product's compose files (./config, env_file: .env) resolve
+# to the host paths the daemon needs. The image is third-party and pinned by digest
+# at release, like postgres and etcd (deploy/resolve-image-digests.sh).
+# =============================================================================
+name: taranac-update-finisher
+
+services:
+  finisher:
+    container_name: taranac-update-finisher
+    image: docker:27.5.1-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
+    restart: unless-stopped
+    working_dir: ${FINISHER_DIR:?the updater sets FINISHER_DIR}
+    entrypoint: ["sh", "${FINISHER_DIR}/update-finisher.sh"]
+    command: ["${FINISHER_DIR}", "${FINISHER_VERSION:?the updater sets FINISHER_VERSION}"]
+    environment:
+      FINISHER_KEY: ${FINISHER_KEY:?the updater sets FINISHER_KEY}
+      FINISHER_RECORD: ${FINISHER_RECORD:?the updater sets FINISHER_RECORD}
+      FINISHER_ETCD: ${FINISHER_ETCD:-taranac-etcd}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${FINISHER_DIR}:${FINISHER_DIR}
+    network_mode: none
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+        max-file: "2"
